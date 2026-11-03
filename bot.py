@@ -1,0 +1,1367 @@
+# bot.py
+import asyncio
+import sys
+import os
+import hashlib
+import secrets
+import logging
+import fcntl
+import string
+from datetime import datetime, timedelta
+from typing import Optional
+
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, ChatMember, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+import asyncpg
+
+# ========== БЛОКИРОВКА ДЛЯ ПРЕДОТВРАЩЕНИЯ ДВОЙНОГО ЗАПУСКА ==========
+try:
+    lock_file = open('/tmp/bot.lock', 'w')
+    fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except IOError:
+    print("❌ Bot already running! Exiting...")
+    sys.exit(0)
+except Exception as e:
+    print(f"⚠️ Lock error: {e}")
+
+# ========== НАСТРОЙКА ЛОГГИРОВАНИЯ ==========
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# ========== ПРОВЕРКА ПЕРЕМЕННЫХ ==========
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    print("❌ BOT_TOKEN not set!")
+    sys.exit(1)
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    print("❌ DATABASE_URL not set!")
+    sys.exit(1)
+
+ADMIN_IDS_STR = os.getenv("ADMIN_IDS", "")
+ADMIN_IDS = []
+if ADMIN_IDS_STR:
+    for x in ADMIN_IDS_STR.split(","):
+        try:
+            if x.strip():
+                ADMIN_IDS.append(int(x.strip()))
+        except ValueError:
+            print(f"⚠️ Invalid ADMIN_IDS value: {x}")
+            pass
+
+# ========== КАНАЛЫ ДЛЯ ПРОВЕРКИ ПОДПИСКИ ==========
+REQUIRED_CHANNELS = [
+    "@Kerrr1337_pub",
+    "@AstraNewsCommunity"
+]
+
+print(f"🤖 Bot starting...")
+print(f"📋 Admin IDs: {ADMIN_IDS}")
+print(f"📢 Required channels: {', '.join(REQUIRED_CHANNELS)}")
+
+if not ADMIN_IDS:
+    print("⚠️ WARNING: No admin IDs set! Some commands will not work.")
+
+# ========== ИНИЦИАЛИЗАЦИЯ ==========
+bot = Bot(token=BOT_TOKEN)
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
+
+# ========== STATES FOR FSM ==========
+class RegistrationStates(StatesGroup):
+    waiting_for_login = State()
+    waiting_for_password = State()
+
+class LoginStates(StatesGroup):
+    waiting_for_login = State()
+    waiting_for_password = State()
+
+class ChangelogStates(StatesGroup):
+    waiting_for_changelog = State()
+
+class KeyGenStates(StatesGroup):
+    waiting_for_days = State()
+
+class BanStates(StatesGroup):
+    waiting_for_username = State()
+
+class UnbanStates(StatesGroup):
+    waiting_for_username = State()
+
+# ========== HELPER FUNCTIONS ==========
+def generate_promo_code(length: int = 8) -> str:
+    """
+    Генерирует промокод из заданного количества символов.
+    Использует буквы верхнего регистра и цифры для удобства чтения.
+    Исключает похожие символы: 0, O, 1, I.
+    """
+    characters = string.ascii_uppercase + string.digits
+    # Убираем похожие символы для удобства
+    characters = characters.replace('O', '').replace('0', '').replace('I', '').replace('1', '')
+    
+    # Генерируем код пока не получим уникальный
+    while True:
+        code = ''.join(secrets.choice(characters) for _ in range(length))
+        # Добавляем проверку на повторяющиеся символы для читаемости
+        if len(set(code)) >= length // 2:  # Хотя бы половина символов уникальны
+            return code
+
+async def check_subscription(user_id: int) -> tuple[bool, list[str]]:
+    """
+    Проверяет подписку пользователя на все необходимые каналы.
+    Возвращает (все_подписан, список_неподписанных_каналов)
+    """
+    not_subscribed = []
+    
+    for channel in REQUIRED_CHANNELS:
+        try:
+            # Получаем информацию о членстве в канале
+            chat_member = await bot.get_chat_member(channel, user_id)
+            
+            # Проверяем статус
+            if chat_member.status in ['left', 'kicked']:
+                not_subscribed.append(channel)
+        except Exception as e:
+            logger.error(f"Error checking subscription to {channel}: {e}")
+            # Если бот не может проверить, считаем что пользователь не подписан
+            not_subscribed.append(channel)
+    
+    return len(not_subscribed) == 0, not_subscribed
+
+def get_subscription_keyboard(not_subscribed_channels: list[str]) -> InlineKeyboardMarkup:
+    """Создает клавиатуру с кнопками для подписки на каналы"""
+    buttons = []
+    
+    for channel in not_subscribed_channels:
+        channel_url = f"https://t.me/{channel.replace('@', '')}"
+        buttons.append([InlineKeyboardButton(
+            text=f"📢 Подписаться на {channel}",
+            url=channel_url
+        )])
+    
+    buttons.append([InlineKeyboardButton(
+        text="🔄 Проверить подписку",
+        callback_data="check_subscription"
+    )])
+    
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def get_main_menu_keyboard(is_admin: bool, is_registered: bool = False) -> ReplyKeyboardMarkup:
+    """Создает основную клавиатуру меню"""
+    buttons = []
+    
+    # Кнопки регистрации/входа
+    if not is_registered:
+        buttons.append([KeyboardButton(text="📝 Регистрация")])
+        buttons.append([KeyboardButton(text="🔑 Войти")])
+    else:
+        buttons.append([KeyboardButton(text="👤 Профиль")])
+        buttons.append([KeyboardButton(text="🔑 Запросить ключ")])
+    
+    # Общие кнопки
+    buttons.append([KeyboardButton(text="📜 Ченжлог")])
+    buttons.append([KeyboardButton(text="📢 Проверить подписки")])
+    
+    # Админские кнопки
+    if is_admin:
+        buttons.extend([
+            [KeyboardButton(text="👥 Все игроки")],
+            [KeyboardButton(text="🔑 Создать ключ")],
+            [KeyboardButton(text="🚫 Бан игрока")],
+            [KeyboardButton(text="✅ Разбан игрока")],
+            [KeyboardButton(text="📝 Добавить в ченжлог")],
+            [KeyboardButton(text="📋 Заявки на ключи")]
+        ])
+    
+    buttons.append([KeyboardButton(text="📋 Меню")])
+    
+    return ReplyKeyboardMarkup(
+        keyboard=buttons,
+        resize_keyboard=True,
+        one_time_keyboard=False
+    )
+
+# ========== MIDDLEWARE ДЛЯ ПРОВЕРКИ ПОДПИСКИ ==========
+class SubscriptionMiddleware:
+    async def __call__(self, handler, event, data):
+        # Пропускаем проверку для администраторов
+        user_id = None
+        
+        if hasattr(event, 'from_user') and event.from_user:
+            user_id = event.from_user.id
+        elif hasattr(event, 'message') and event.message and event.message.from_user:
+            user_id = event.message.from_user.id
+        elif hasattr(event, 'callback_query') and event.callback_query and event.callback_query.from_user:
+            user_id = event.callback_query.from_user.id
+        
+        if not user_id:
+            return await handler(event, data)
+        
+        # Администраторы пропускают проверку
+        if user_id in ADMIN_IDS:
+            return await handler(event, data)
+        
+        # Проверяем подписку
+        is_subscribed, not_subscribed = await check_subscription(user_id)
+        
+        if not is_subscribed and not (hasattr(event, 'data') and event.data == 'check_subscription'):
+            # Если пользователь не подписан, отправляем сообщение
+            keyboard = get_subscription_keyboard(not_subscribed)
+            
+            if hasattr(event, 'answer'):
+                await event.answer()
+                await event.message.answer(
+                    "⚠️ Для использования бота необходимо подписаться на следующие каналы:\n\n"
+                    + "\n".join([f"• {channel}" for channel in not_subscribed]),
+                    reply_markup=keyboard
+                )
+            else:
+                await event.answer(
+                    "⚠️ Для использования бота необходимо подписаться на все каналы!",
+                    reply_markup=keyboard
+                )
+            return
+        
+        # Пользователь подписан или это запрос на проверку
+        return await handler(event, data)
+
+# ========== ИНИЦИАЛИЗАЦИЯ БД С МИГРАЦИЕЙ ==========
+async def init_db():
+    try:
+        conn = await asyncpg.connect(DATABASE_URL)
+        print("✅ Connected to database")
+        
+        # Проверяем существование таблицы users
+        table_exists = await conn.fetchval("""
+            SELECT EXISTS (
+                SELECT 1 FROM information_schema.tables 
+                WHERE table_name = 'users'
+            )
+        """)
+        
+        if not table_exists:
+            # Создаем таблицу с нуля
+            await conn.execute("""
+                CREATE TABLE users (
+                    id SERIAL PRIMARY KEY,
+                    login VARCHAR(50) UNIQUE NOT NULL,
+                    password_hash VARCHAR(255) NOT NULL,
+                    salt VARCHAR(50) NOT NULL,
+                    is_banned BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    telegram_id BIGINT UNIQUE
+                )
+            """)
+            print("✅ Table 'users' created")
+        else:
+            # Проверяем наличие колонки telegram_id
+            column_exists = await conn.fetchval("""
+                SELECT EXISTS (
+                    SELECT 1 FROM information_schema.columns 
+                    WHERE table_name = 'users' AND column_name = 'telegram_id'
+                )
+            """)
+            
+            if not column_exists:
+                await conn.execute("""
+                    ALTER TABLE users ADD COLUMN telegram_id BIGINT UNIQUE
+                """)
+                print("✅ Added 'telegram_id' column to users table")
+        
+        # Создаем таблицу keys
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS keys (
+                id SERIAL PRIMARY KEY,
+                key_code VARCHAR(50) UNIQUE NOT NULL,
+                days_valid INTEGER NOT NULL,
+                used_by INTEGER REFERENCES users(id),
+                used_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                created_by INTEGER REFERENCES users(id),
+                is_active BOOLEAN DEFAULT TRUE
+            )
+        """)
+        
+        # Проверяем наличие колонки created_by в keys
+        column_exists = await conn.fetchval("""
+            SELECT EXISTS (
+                SELECT 1 FROM information_schema.columns 
+                WHERE table_name = 'keys' AND column_name = 'created_by'
+            )
+        """)
+        
+        if not column_exists:
+            await conn.execute("""
+                ALTER TABLE keys ADD COLUMN created_by INTEGER REFERENCES users(id)
+            """)
+            print("✅ Added 'created_by' column to keys table")
+        
+        # Добавляем колонку is_active если её нет
+        column_exists = await conn.fetchval("""
+            SELECT EXISTS (
+                SELECT 1 FROM information_schema.columns 
+                WHERE table_name = 'keys' AND column_name = 'is_active'
+            )
+        """)
+        
+        if not column_exists:
+            await conn.execute("""
+                ALTER TABLE keys ADD COLUMN is_active BOOLEAN DEFAULT TRUE
+            """)
+            print("✅ Added 'is_active' column to keys table")
+        
+        # Создаем остальные таблицы
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS key_requests (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER REFERENCES users(id),
+                status VARCHAR(20) DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                processed_at TIMESTAMP,
+                processed_by INTEGER REFERENCES users(id)
+            )
+        """)
+        
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS changelog (
+                id SERIAL PRIMARY KEY,
+                content TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                created_by INTEGER REFERENCES users(id)
+            )
+        """)
+        
+        await conn.close()
+        print("✅ Database initialized successfully!")
+        return True
+    except Exception as e:
+        print(f"❌ Database error: {e}")
+        return False
+
+# ========== HELPER FUNCTIONS ==========
+async def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+async def get_user_by_telegram_id(telegram_id: int, conn):
+    return await conn.fetchrow(
+        "SELECT id, login, is_banned FROM users WHERE telegram_id = $1",
+        telegram_id
+    )
+
+async def get_user_by_login(login: str, conn):
+    return await conn.fetchrow(
+        "SELECT id, login, is_banned, password_hash, salt FROM users WHERE login = $1",
+        login
+    )
+
+async def has_active_key(user_id: int, conn) -> bool:
+    """Проверяет, есть ли у пользователя активный ключ"""
+    result = await conn.fetchval(
+        "SELECT COUNT(*) FROM keys WHERE used_by = $1 AND is_active = TRUE",
+        user_id
+    )
+    return result > 0
+
+async def get_user_active_key(user_id: int, conn) -> Optional[dict]:
+    """Получает активный ключ пользователя"""
+    return await conn.fetchrow(
+        """
+        SELECT id, key_code, days_valid, used_at, is_active
+        FROM keys 
+        WHERE used_by = $1 AND is_active = TRUE
+        ORDER BY used_at DESC 
+        LIMIT 1
+        """,
+        user_id
+    )
+
+async def check_user_registered(telegram_id: int) -> bool:
+    """Проверяет, зарегистрирован ли пользователь"""
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        user = await get_user_by_telegram_id(telegram_id, conn)
+        return user is not None
+    finally:
+        await conn.close()
+
+# ========== COMMANDS ==========
+@dp.message(Command("start"))
+async def start(message: Message):
+    # Проверяем подписку
+    is_subscribed, not_subscribed = await check_subscription(message.from_user.id)
+    
+    if not is_subscribed and message.from_user.id not in ADMIN_IDS:
+        keyboard = get_subscription_keyboard(not_subscribed)
+        await message.answer(
+            "🚀 Добро пожаловать в Astra Key Management Bot!\n\n"
+            "⚠️ Для использования бота необходимо подписаться на все каналы:\n\n"
+            + "\n".join([f"• {channel}" for channel in not_subscribed]) +
+            "\n\nПосле подписки нажмите кнопку 'Проверить подписку'.",
+            reply_markup=keyboard
+        )
+        return
+    
+    is_registered = await check_user_registered(message.from_user.id)
+    
+    await message.answer(
+        "🚀 Astra Key Management Bot\n\n"
+        "Добро пожаловать! Используйте кнопки меню для навигации.\n"
+        "Нажмите '📋 Меню' для просмотра всех доступных функций.",
+        reply_markup=get_main_menu_keyboard(
+            await is_admin(message.from_user.id),
+            is_registered
+        )
+    )
+
+@dp.message(lambda message: message.text == "📋 Меню")
+async def show_menu(message: Message):
+    # Проверяем подписку
+    is_subscribed, not_subscribed = await check_subscription(message.from_user.id)
+    
+    if not is_subscribed and message.from_user.id not in ADMIN_IDS:
+        keyboard = get_subscription_keyboard(not_subscribed)
+        await message.answer(
+            "⚠️ Для использования бота необходимо подписаться на все каналы!\n\n"
+            + "\n".join([f"• {channel}" for channel in not_subscribed]),
+            reply_markup=keyboard
+        )
+        return
+    
+    is_registered = await check_user_registered(message.from_user.id)
+    
+    await message.answer(
+        "📋 Главное меню\n\n"
+        "Выберите действие:",
+        reply_markup=get_main_menu_keyboard(
+            await is_admin(message.from_user.id),
+            is_registered
+        )
+    )
+
+# ========== CHECK SUBSCRIPTION ==========
+@dp.message(lambda message: message.text == "📢 Проверить подписки")
+async def check_subscription_command(message: Message):
+    await message.answer("🔍 Проверяем подписки...")
+    
+    is_subscribed, not_subscribed = await check_subscription(message.from_user.id)
+    
+    if is_subscribed or message.from_user.id in ADMIN_IDS:
+        is_registered = await check_user_registered(message.from_user.id)
+        await message.answer(
+            "✅ Вы подписаны на все необходимые каналы!\n\n"
+            "🚀 Добро пожаловать в Astra Key Management Bot!\n"
+            "Используйте меню для навигации.",
+            reply_markup=get_main_menu_keyboard(
+                await is_admin(message.from_user.id),
+                is_registered
+            )
+        )
+    else:
+        keyboard = get_subscription_keyboard(not_subscribed)
+        await message.answer(
+            "⚠️ Вы не подписаны на следующие каналы:\n\n"
+            + "\n".join([f"• {channel}" for channel in not_subscribed]) +
+            "\n\nПосле подписки нажмите кнопку 'Проверить подписку'.",
+            reply_markup=keyboard
+        )
+
+@dp.callback_query(lambda c: c.data == "check_subscription")
+async def check_subscription_callback(callback: CallbackQuery):
+    await callback.answer("🔍 Проверяем подписки...")
+    
+    is_subscribed, not_subscribed = await check_subscription(callback.from_user.id)
+    
+    if is_subscribed or callback.from_user.id in ADMIN_IDS:
+        is_registered = await check_user_registered(callback.from_user.id)
+        await callback.message.edit_text(
+            "✅ Вы подписаны на все необходимые каналы!\n\n"
+            "🚀 Добро пожаловать в Astra Key Management Bot!\n"
+            "Используйте меню для навигации."
+        )
+        await callback.message.answer(
+            "📋 Главное меню",
+            reply_markup=get_main_menu_keyboard(
+                await is_admin(callback.from_user.id),
+                is_registered
+            )
+        )
+    else:
+        keyboard = get_subscription_keyboard(not_subscribed)
+        await callback.message.edit_text(
+            "⚠️ Вы не подписаны на следующие каналы:\n\n"
+            + "\n".join([f"• {channel}" for channel in not_subscribed]) +
+            "\n\nПосле подписки нажмите кнопку 'Проверить подписку'.",
+            reply_markup=keyboard
+        )
+
+# ========== REGISTRATION ==========
+@dp.message(lambda message: message.text == "📝 Регистрация")
+async def register_command(message: Message, state: FSMContext):
+    # Проверяем подписку
+    is_subscribed, not_subscribed = await check_subscription(message.from_user.id)
+    
+    if not is_subscribed and message.from_user.id not in ADMIN_IDS:
+        keyboard = get_subscription_keyboard(not_subscribed)
+        await message.answer(
+            "⚠️ Для регистрации необходимо подписаться на все каналы!",
+            reply_markup=keyboard
+        )
+        return
+    
+    # Проверяем, не зарегистрирован ли уже пользователь
+    if await check_user_registered(message.from_user.id):
+        await message.answer(
+            "❌ Вы уже зарегистрированы!\n"
+            "Используйте '👤 Профиль' для просмотра данных.",
+            reply_markup=get_main_menu_keyboard(
+                await is_admin(message.from_user.id),
+                True
+            )
+        )
+        return
+    
+    await message.answer("Введите ваш логин:")
+    await state.set_state(RegistrationStates.waiting_for_login)
+
+@dp.message(RegistrationStates.waiting_for_login)
+async def process_login(message: Message, state: FSMContext):
+    await state.update_data(login=message.text)
+    await message.answer("Введите ваш пароль:")
+    await state.set_state(RegistrationStates.waiting_for_password)
+
+@dp.message(RegistrationStates.waiting_for_password)
+async def process_password(message: Message, state: FSMContext):
+    data = await state.get_data()
+    login = data['login']
+    password = message.text
+    
+    salt = secrets.token_hex(16)
+    hash_obj = hashlib.pbkdf2_hmac('sha256', password.encode(), salt.encode(), 100000)
+    password_hash = hash_obj.hex()
+    
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        existing = await conn.fetchrow(
+            "SELECT id FROM users WHERE telegram_id = $1 OR login = $2",
+            message.from_user.id, login
+        )
+        
+        if existing:
+            await message.answer(
+                "❌ Вы уже зарегистрированы или логин занят!\n"
+                "Используйте '/start' для просмотра меню."
+            )
+            await state.clear()
+            return
+        
+        await conn.execute(
+            "INSERT INTO users (login, password_hash, salt, telegram_id) VALUES ($1, $2, $3, $4)",
+            login, password_hash, salt, message.from_user.id
+        )
+        await message.answer(
+            f"✅ Регистрация успешна!\n"
+            f"👤 Логин: {login}\n"
+            f"🔑 Пароль: {password}\n\n"
+            f"⚠️ Сохраните эти данные!\n"
+            f"Теперь вы можете запросить ключ.",
+            reply_markup=get_main_menu_keyboard(
+                await is_admin(message.from_user.id),
+                True
+            )
+        )
+    except asyncpg.exceptions.UniqueViolationError:
+        await message.answer("❌ Пользователь с таким логином уже существует!")
+    except Exception as e:
+        logger.error(f"Registration error: {e}")
+        await message.answer(f"❌ Ошибка при регистрации: {str(e)}")
+    finally:
+        await conn.close()
+        await state.clear()
+
+# ========== LOGIN ==========
+@dp.message(lambda message: message.text == "🔑 Войти")
+async def login_command(message: Message, state: FSMContext):
+    # Проверяем подписку
+    is_subscribed, not_subscribed = await check_subscription(message.from_user.id)
+    
+    if not is_subscribed and message.from_user.id not in ADMIN_IDS:
+        keyboard = get_subscription_keyboard(not_subscribed)
+        await message.answer(
+            "⚠️ Для входа необходимо подписаться на все каналы!",
+            reply_markup=keyboard
+        )
+        return
+    
+    # Проверяем, не зарегистрирован ли уже пользователь
+    if await check_user_registered(message.from_user.id):
+        await message.answer(
+            "❌ Вы уже авторизованы!\n"
+            "Используйте '👤 Профиль' для просмотра данных.",
+            reply_markup=get_main_menu_keyboard(
+                await is_admin(message.from_user.id),
+                True
+            )
+        )
+        return
+    
+    await message.answer("Введите ваш логин:")
+    await state.set_state(LoginStates.waiting_for_login)
+
+@dp.message(LoginStates.waiting_for_login)
+async def process_login_username(message: Message, state: FSMContext):
+    await state.update_data(login=message.text)
+    await message.answer("Введите ваш пароль:")
+    await state.set_state(LoginStates.waiting_for_password)
+
+@dp.message(LoginStates.waiting_for_password)
+async def process_login_password(message: Message, state: FSMContext):
+    data = await state.get_data()
+    login = data['login']
+    password = message.text
+    
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        user = await get_user_by_login(login, conn)
+        
+        if not user:
+            await message.answer("❌ Неверный логин или пароль!")
+            await state.clear()
+            return
+        
+        # Проверяем пароль
+        hash_obj = hashlib.pbkdf2_hmac('sha256', password.encode(), user['salt'].encode(), 100000)
+        password_hash = hash_obj.hex()
+        
+        if password_hash != user['password_hash']:
+            await message.answer("❌ Неверный логин или пароль!")
+            await state.clear()
+            return
+        
+        # Проверяем, не привязан ли уже этот аккаунт к другому телеграму
+        existing_telegram = await conn.fetchrow(
+            "SELECT telegram_id FROM users WHERE login = $1 AND telegram_id IS NOT NULL",
+            login
+        )
+        
+        if existing_telegram and existing_telegram['telegram_id'] != message.from_user.id:
+            await message.answer(
+                "❌ Этот аккаунт уже привязан к другому пользователю Telegram!\n"
+                "Обратитесь к администратору для решения проблемы."
+            )
+            await state.clear()
+            return
+        
+        # Обновляем telegram_id для пользователя
+        await conn.execute(
+            "UPDATE users SET telegram_id = $1 WHERE login = $2",
+            message.from_user.id, login
+        )
+        
+        await message.answer(
+            f"✅ Вы успешно вошли!\n"
+            f"👤 Логин: {login}",
+            reply_markup=get_main_menu_keyboard(
+                await is_admin(message.from_user.id),
+                True
+            )
+        )
+    except Exception as e:
+        logger.error(f"Login error: {e}")
+        await message.answer(f"❌ Ошибка при входе: {str(e)}")
+    finally:
+        await conn.close()
+        await state.clear()
+
+# ========== PROFILE ==========
+@dp.message(lambda message: message.text == "👤 Профиль")
+async def profile_command(message: Message):
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        user = await get_user_by_telegram_id(message.from_user.id, conn)
+        
+        if not user:
+            await message.answer(
+                "❌ Вы не авторизованы!\n"
+                "Используйте кнопку '🔑 Войти' для входа в существующий аккаунт\n"
+                "или '📝 Регистрация' для создания нового.",
+                reply_markup=get_main_menu_keyboard(
+                    await is_admin(message.from_user.id),
+                    False
+                )
+            )
+            return
+        
+        is_admin_user = await is_admin(message.from_user.id)
+        status = "👑 Admin" if is_admin_user else "🎮 Player"
+        ban_status = "🚫 Забанен" if user['is_banned'] else "✅ Активен"
+        
+        # Получаем активный ключ
+        active_key = await get_user_active_key(user['id'], conn)
+        
+        text = f"👤 Профиль\n\n"
+        text += f"Логин: {user['login']}\n"
+        text += f"Статус: {status}\n"
+        text += f"Состояние: {ban_status}\n"
+        
+        if active_key:
+            expiry = active_key['used_at'] + timedelta(days=active_key['days_valid'])
+            days_left = (expiry - datetime.now()).days
+            text += f"\n🔑 Активный ключ: {active_key['key_code']}\n"
+            text += f"📅 Действует до: {expiry.strftime('%d.%m.%Y')}\n"
+            text += f"⏳ Осталось: {max(0, days_left)} дней\n"
+        else:
+            text += f"\n🔑 Нет активного ключа\n"
+            text += f"Нажмите 'Запросить ключ' для получения."
+        
+        await message.answer(
+            text,
+            reply_markup=get_main_menu_keyboard(
+                is_admin_user,
+                True
+            )
+        )
+    except Exception as e:
+        logger.error(f"Profile error: {e}")
+        await message.answer(f"❌ Ошибка: {e}")
+    finally:
+        await conn.close()
+
+# ========== CHANGELOG ==========
+@dp.message(lambda message: message.text == "📜 Ченжлог")
+async def view_changelog_command(message: Message):
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        changelogs = await conn.fetch(
+            "SELECT content, created_at FROM changelog ORDER BY created_at DESC LIMIT 10"
+        )
+        
+        if not changelogs:
+            await message.answer("📭 Ченжлог пока пуст.")
+            return
+        
+        text = "📜 Последние изменения:\n\n"
+        for i, log in enumerate(changelogs, 1):
+            text += f"{i}. {log['content']}\n"
+            text += f"   📅 {log['created_at'].strftime('%d.%m.%Y %H:%M')}\n\n"
+        
+        is_registered = await check_user_registered(message.from_user.id)
+        await message.answer(
+            text,
+            reply_markup=get_main_menu_keyboard(
+                await is_admin(message.from_user.id),
+                is_registered
+            )
+        )
+    except Exception as e:
+        logger.error(f"Changelog error: {e}")
+        await message.answer(f"❌ Ошибка: {e}")
+    finally:
+        await conn.close()
+
+# ========== REQUEST KEY ==========
+@dp.message(lambda message: message.text == "🔑 Запросить ключ")
+async def request_key_command(message: Message):
+    # Проверяем подписку
+    is_subscribed, not_subscribed = await check_subscription(message.from_user.id)
+    
+    if not is_subscribed and message.from_user.id not in ADMIN_IDS:
+        keyboard = get_subscription_keyboard(not_subscribed)
+        await message.answer(
+            "⚠️ Для запроса ключа необходимо подписаться на все каналы!",
+            reply_markup=keyboard
+        )
+        return
+    
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        user = await get_user_by_telegram_id(message.from_user.id, conn)
+        
+        if not user:
+            await message.answer(
+                "❌ Сначала авторизуйтесь!\n"
+                "Используйте кнопку '🔑 Войти' для входа в существующий аккаунт\n"
+                "или '📝 Регистрация' для создания нового.",
+                reply_markup=get_main_menu_keyboard(
+                    await is_admin(message.from_user.id),
+                    False
+                )
+            )
+            return
+        
+        if user['is_banned']:
+            await message.answer("🚫 Вы забанены и не можете запрашивать ключи!")
+            return
+        
+        # Проверяем, есть ли уже активный ключ
+        has_key = await has_active_key(user['id'], conn)
+        if has_key:
+            await message.answer(
+                "❌ У вас уже есть активный ключ!\n"
+                "Один аккаунт может иметь только один активный ключ."
+            )
+            return
+        
+        existing = await conn.fetchrow(
+            "SELECT id FROM key_requests WHERE user_id = $1 AND status = 'pending'",
+            user['id']
+        )
+        
+        if existing:
+            await message.answer("⏳ У вас уже есть активная заявка на получение ключа!")
+            return
+        
+        await conn.execute(
+            "INSERT INTO key_requests (user_id) VALUES ($1)",
+            user['id']
+        )
+        
+        await message.answer(
+            "✅ Заявка на получение ключа отправлена!\n"
+            "Ожидайте решения администратора.",
+            reply_markup=get_main_menu_keyboard(
+                await is_admin(message.from_user.id),
+                True
+            )
+        )
+        
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_message(
+                    admin_id,
+                    f"📨 Новая заявка на ключ!\n"
+                    f"👤 Пользователь: {user['login']}\n"
+                    f"🆔 ID пользователя: {user['id']}"
+                )
+            except Exception as e:
+                logger.error(f"Failed to notify admin {admin_id}: {e}")
+    except Exception as e:
+        logger.error(f"Request key error: {e}")
+        await message.answer(f"❌ Ошибка: {e}")
+    finally:
+        await conn.close()
+
+# ========== ADMIN: VIEW PLAYERS ==========
+@dp.message(lambda message: message.text == "👥 Все игроки")
+async def view_players_command(message: Message):
+    if not await is_admin(message.from_user.id):
+        await message.answer("❌ Недостаточно прав!")
+        return
+    
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        users = await conn.fetch(
+            """
+            SELECT u.id, u.login, u.is_banned, u.created_at, u.telegram_id,
+                   COUNT(k.id) as key_count,
+                   EXISTS(SELECT 1 FROM keys k2 WHERE k2.used_by = u.id AND k2.is_active = TRUE) as has_active_key
+            FROM users u
+            LEFT JOIN keys k ON u.id = k.used_by AND k.is_active = TRUE
+            GROUP BY u.id
+            ORDER BY u.created_at DESC
+            """
+        )
+        
+        if not users:
+            await message.answer("👥 Нет зарегистрированных игроков.")
+            return
+        
+        text = "👥 Все игроки:\n\n"
+        for user in users:
+            status = "🚫" if user['is_banned'] else "✅"
+            key_status = "🔑" if user['has_active_key'] else "❌"
+            reg_date = user['created_at'].strftime('%d.%m.%Y')
+            telegram = f" (TG: {user['telegram_id']})" if user['telegram_id'] else ""
+            text += f"{status} {key_status} {user['login']}{telegram} - {reg_date}\n"
+        
+        await message.answer(
+            text,
+            reply_markup=get_main_menu_keyboard(True, True)
+        )
+    except Exception as e:
+        logger.error(f"View players error: {e}")
+        await message.answer(f"❌ Ошибка: {e}")
+    finally:
+        await conn.close()
+
+# ========== ADMIN: CREATE KEY ==========
+@dp.message(lambda message: message.text == "🔑 Создать ключ")
+async def create_key_command(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id):
+        await message.answer("❌ Недостаточно прав!")
+        return
+    
+    await message.answer(
+        "Введите количество дней действия ключа (число):\n"
+        "Пример: 30"
+    )
+    await state.set_state(KeyGenStates.waiting_for_days)
+
+@dp.message(KeyGenStates.waiting_for_days)
+async def process_key_days(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id):
+        await message.answer("❌ Недостаточно прав!")
+        await state.clear()
+        return
+    
+    try:
+        days = int(message.text)
+        if days <= 0:
+            await message.answer("❌ Количество дней должно быть положительным числом!")
+            return
+    except ValueError:
+        await message.answer("❌ Введите корректное число!")
+        return
+    
+    # Генерируем 8-символьный промокод
+    key_code = generate_promo_code(8)
+    
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        # Проверяем уникальность ключа
+        existing = await conn.fetchrow(
+            "SELECT id FROM keys WHERE key_code = $1",
+            key_code
+        )
+        
+        # Если ключ уже существует, генерируем новый
+        while existing:
+            key_code = generate_promo_code(8)
+            existing = await conn.fetchrow(
+                "SELECT id FROM keys WHERE key_code = $1",
+                key_code
+            )
+        
+        user = await get_user_by_telegram_id(message.from_user.id, conn)
+        
+        if user:
+            await conn.execute(
+                "INSERT INTO keys (key_code, days_valid, created_by, is_active) VALUES ($1, $2, $3, TRUE)",
+                key_code, days, user['id']
+            )
+        else:
+            await conn.execute(
+                "INSERT INTO keys (key_code, days_valid, is_active) VALUES ($1, $2, TRUE)",
+                key_code, days
+            )
+        
+        await message.answer(
+            f"✅ Ключ создан!\n\n"
+            f"🔑 `{key_code}`\n"
+            f"📅 Действует {days} дней\n\n"
+            f"💡 Ключ состоит из 8 символов (буквы и цифры)\n"
+            f"Пример: A7B3C9D2",
+            parse_mode="Markdown",
+            reply_markup=get_main_menu_keyboard(True, True)
+        )
+    except Exception as e:
+        logger.error(f"Gen key error: {e}")
+        await message.answer(f"❌ Ошибка: {e}")
+    finally:
+        await conn.close()
+        await state.clear()
+
+# ========== ADMIN: BAN ==========
+@dp.message(lambda message: message.text == "🚫 Бан игрока")
+async def ban_player_command(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id):
+        await message.answer("❌ Недостаточно прав!")
+        return
+    
+    await message.answer("Введите логин игрока для бана:")
+    await state.set_state(BanStates.waiting_for_username)
+
+@dp.message(BanStates.waiting_for_username)
+async def process_ban_user(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id):
+        await message.answer("❌ Недостаточно прав!")
+        await state.clear()
+        return
+    
+    login = message.text.strip()
+    if not login:
+        await message.answer("❌ Введите логин!")
+        return
+    
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        user = await get_user_by_login(login, conn)
+        
+        if not user:
+            await message.answer(f"❌ Игрок {login} не найден!")
+            await state.clear()
+            return
+        
+        if user['is_banned']:
+            await message.answer(f"ℹ️ Игрок {login} уже забанен!")
+            await state.clear()
+            return
+        
+        await conn.execute(
+            "UPDATE users SET is_banned = TRUE WHERE login = $1",
+            login
+        )
+        
+        # Деактивируем все ключи пользователя
+        await conn.execute(
+            "UPDATE keys SET is_active = FALSE WHERE used_by = $1",
+            user['id']
+        )
+        
+        await message.answer(
+            f"🚫 Игрок {login} забанен!\n"
+            f"Все его ключи деактивированы.",
+            reply_markup=get_main_menu_keyboard(True, True)
+        )
+        
+        # Уведомляем пользователя
+        user_data = await conn.fetchrow(
+            "SELECT telegram_id FROM users WHERE login = $1",
+            login
+        )
+        if user_data and user_data['telegram_id']:
+            try:
+                await bot.send_message(
+                    user_data['telegram_id'],
+                    f"🚫 Вы были забанены администратором!\n"
+                    f"Все ваши ключи деактивированы."
+                )
+            except:
+                pass
+    except Exception as e:
+        logger.error(f"Ban error: {e}")
+        await message.answer(f"❌ Ошибка: {e}")
+    finally:
+        await conn.close()
+        await state.clear()
+
+# ========== ADMIN: UNBAN ==========
+@dp.message(lambda message: message.text == "✅ Разбан игрока")
+async def unban_player_command(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id):
+        await message.answer("❌ Недостаточно прав!")
+        return
+    
+    await message.answer("Введите логин игрока для разбана:")
+    await state.set_state(UnbanStates.waiting_for_username)
+
+@dp.message(UnbanStates.waiting_for_username)
+async def process_unban_user(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id):
+        await message.answer("❌ Недостаточно прав!")
+        await state.clear()
+        return
+    
+    login = message.text.strip()
+    if not login:
+        await message.answer("❌ Введите логин!")
+        return
+    
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        user = await get_user_by_login(login, conn)
+        
+        if not user:
+            await message.answer(f"❌ Игрок {login} не найден!")
+            await state.clear()
+            return
+        
+        if not user['is_banned']:
+            await message.answer(f"ℹ️ Игрок {login} не забанен!")
+            await state.clear()
+            return
+        
+        await conn.execute(
+            "UPDATE users SET is_banned = FALSE WHERE login = $1",
+            login
+        )
+        
+        await message.answer(
+            f"✅ Игрок {login} разбанен!",
+            reply_markup=get_main_menu_keyboard(True, True)
+        )
+        
+        # Уведомляем пользователя
+        user_data = await conn.fetchrow(
+            "SELECT telegram_id FROM users WHERE login = $1",
+            login
+        )
+        if user_data and user_data['telegram_id']:
+            try:
+                await bot.send_message(
+                    user_data['telegram_id'],
+                    f"✅ Вы были разбанены администратором!"
+                )
+            except:
+                pass
+    except Exception as e:
+        logger.error(f"Unban error: {e}")
+        await message.answer(f"❌ Ошибка: {e}")
+    finally:
+        await conn.close()
+        await state.clear()
+
+# ========== ADMIN: ADD CHANGELOG ==========
+@dp.message(lambda message: message.text == "📝 Добавить в ченжлог")
+async def add_changelog_command(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id):
+        await message.answer("❌ Недостаточно прав!")
+        return
+    
+    await message.answer(
+        "Введите текст новости для ченжлога:\n"
+        "Пример: Добавлена новая функция X"
+    )
+    await state.set_state(ChangelogStates.waiting_for_changelog)
+
+@dp.message(ChangelogStates.waiting_for_changelog)
+async def process_changelog(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id):
+        await message.answer("❌ Недостаточно прав!")
+        await state.clear()
+        return
+    
+    content = message.text.strip()
+    if not content:
+        await message.answer("❌ Текст не может быть пустым!")
+        return
+    
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        user = await get_user_by_telegram_id(message.from_user.id, conn)
+        
+        if user:
+            await conn.execute(
+                "INSERT INTO changelog (content, created_by) VALUES ($1, $2)",
+                content, user['id']
+            )
+        else:
+            await conn.execute(
+                "INSERT INTO changelog (content) VALUES ($1)",
+                content
+            )
+        
+        await message.answer(
+            f"✅ Новость добавлена в ченжлог!\n\n"
+            f"📝 {content}",
+            reply_markup=get_main_menu_keyboard(True, True)
+        )
+    except Exception as e:
+        logger.error(f"Add changelog error: {e}")
+        await message.answer(f"❌ Ошибка: {e}")
+    finally:
+        await conn.close()
+        await state.clear()
+
+# ========== ADMIN: VIEW REQUESTS ==========
+@dp.message(lambda message: message.text == "📋 Заявки на ключи")
+async def view_requests_command(message: Message):
+    if not await is_admin(message.from_user.id):
+        await message.answer("❌ Недостаточно прав!")
+        return
+    
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        requests = await conn.fetch(
+            """
+            SELECT kr.id, kr.user_id, u.login, u.is_banned, kr.created_at
+            FROM key_requests kr
+            JOIN users u ON kr.user_id = u.id
+            WHERE kr.status = 'pending'
+            ORDER BY kr.created_at ASC
+            """
+        )
+        
+        if not requests:
+            await message.answer("📋 Нет активных заявок на ключи.")
+            return
+        
+        text = "📋 Активные заявки:\n\n"
+        for req in requests:
+            status = "🚫" if req['is_banned'] else "✅"
+            text += f"🆔 ID: {req['id']}\n"
+            text += f"👤 {req['login']} {status}\n"
+            text += f"📅 {req['created_at'].strftime('%d.%m.%Y %H:%M')}\n"
+            text += f"---\n"
+        
+        await message.answer(
+            text,
+            reply_markup=get_request_keyboard()
+        )
+    except Exception as e:
+        logger.error(f"View requests error: {e}")
+        await message.answer(f"❌ Ошибка: {e}")
+    finally:
+        await conn.close()
+
+# ========== ADMIN: PROCESS KEY REQUEST ==========
+@dp.callback_query(lambda c: c.data in ["approve_key", "reject_key"])
+async def process_key_request(callback: CallbackQuery):
+    if not await is_admin(callback.from_user.id):
+        await callback.answer("❌ Недостаточно прав!", show_alert=True)
+        return
+    
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        # Получаем первую активную заявку
+        request = await conn.fetchrow(
+            """
+            SELECT kr.id, kr.user_id, u.login, u.telegram_id
+            FROM key_requests kr
+            JOIN users u ON kr.user_id = u.id
+            WHERE kr.status = 'pending'
+            ORDER BY kr.created_at ASC
+            LIMIT 1
+            """
+        )
+        
+        if not request:
+            await callback.message.answer("❌ Нет активных заявок!")
+            await callback.answer()
+            return
+        
+        admin = await get_user_by_telegram_id(callback.from_user.id, conn)
+        
+        if callback.data == "approve_key":
+            # Проверяем, нет ли уже активного ключа у пользователя
+            has_key = await has_active_key(request['user_id'], conn)
+            if has_key:
+                await callback.message.answer(
+                    f"❌ У пользователя {request['login']} уже есть активный ключ!\n"
+                    "Один аккаунт = один ключ."
+                )
+                await callback.answer()
+                return
+            
+            # Генерируем 8-символьный промокод
+            key_code = generate_promo_code(8)
+            
+            # Проверяем уникальность ключа
+            existing = await conn.fetchrow(
+                "SELECT id FROM keys WHERE key_code = $1",
+                key_code
+            )
+            
+            while existing:
+                key_code = generate_promo_code(8)
+                existing = await conn.fetchrow(
+                    "SELECT id FROM keys WHERE key_code = $1",
+                    key_code
+                )
+            
+            await conn.execute(
+                """
+                INSERT INTO keys (key_code, days_valid, used_by, used_at, is_active) 
+                VALUES ($1, $2, $3, $4, TRUE)
+                """,
+                key_code, 30, request['user_id'], datetime.now()
+            )
+            
+            await conn.execute(
+                "UPDATE key_requests SET status = 'approved', processed_at = NOW(), processed_by = $1 WHERE id = $2",
+                admin['id'] if admin else None, request['id']
+            )
+            
+            await callback.message.answer(
+                f"✅ Заявка одобрена!\n"
+                f"🔑 Ключ: `{key_code}`\n"
+                f"👤 Пользователь: {request['login']}\n"
+                f"📅 Действует 30 дней\n"
+                f"💡 Ключ состоит из 8 символов",
+                parse_mode="Markdown"
+            )
+            
+            # Отправляем ключ пользователю
+            if request['telegram_id']:
+                try:
+                    await bot.send_message(
+                        request['telegram_id'],
+                        f"✅ Ваша заявка на ключ одобрена!\n\n"
+                        f"🔑 Ключ: `{key_code}`\n"
+                        f"📅 Действует 30 дней\n"
+                        f"Используйте ключ для активации.",
+                        parse_mode="Markdown"
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to send key to user: {e}")
+        else:
+            await conn.execute(
+                "UPDATE key_requests SET status = 'rejected', processed_at = NOW(), processed_by = $1 WHERE id = $2",
+                admin['id'] if admin else None, request['id']
+            )
+            
+            await callback.message.answer(f"❌ Заявка пользователя {request['login']} отклонена.")
+            
+            if request['telegram_id']:
+                try:
+                    await bot.send_message(
+                        request['telegram_id'],
+                        "❌ Ваша заявка на ключ отклонена администратором."
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to notify user: {e}")
+        
+    except Exception as e:
+        logger.error(f"Process request error: {e}")
+        await callback.message.answer(f"❌ Ошибка: {e}")
+    finally:
+        await conn.close()
+        await callback.answer()
+
+# ========== ЗАПУСК ==========
+async def main():
+    print("🚀 Starting bot...")
+    
+    if not await init_db():
+        print("❌ Failed to initialize database!")
+        return
+    
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            await bot.delete_webhook(drop_pending_updates=True)
+            print("✅ Webhook cleared")
+            break
+        except Exception as e:
+            print(f"⚠️ Webhook error (attempt {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(2)
+    
+    try:
+        me = await bot.get_me()
+        print(f"✅ Bot connected: @{me.username} (ID: {me.id})")
+    except Exception as e:
+        print(f"❌ Failed to connect to Telegram: {e}")
+        return
+    
+    print("🤖 Bot is running...")
+    print(f"📢 Checking subscriptions to: {', '.join(REQUIRED_CHANNELS)}")
+    
+    while True:
+        try:
+            await dp.start_polling(
+                bot,
+                skip_updates=True,
+                allowed_updates=["message", "callback_query"]
+            )
+        except Exception as e:
+            logger.error(f"Polling error: {e}")
+            print(f"⚠️ Polling crashed, restarting in 5 seconds...")
+            await asyncio.sleep(5)
+            continue
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("🛑 Bot stopped")
+    except Exception as e:
+        print(f"❌ Fatal error: {e}")
+        sys.exit(1)
