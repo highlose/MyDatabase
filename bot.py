@@ -1,1367 +1,1106 @@
-# bot.py
 import asyncio
-import sys
-import os
-import hashlib
-import secrets
+import json
 import logging
-import fcntl
-import string
-from datetime import datetime, timedelta
-from typing import Optional
+import os
+import shutil
+import sqlite3
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
-from aiogram import Bot, Dispatcher, types
-from aiogram.filters import Command
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, ChatMember, ReplyKeyboardMarkup, KeyboardButton
-from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-import asyncpg
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    CallbackQuery,
+    FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    LabeledPrice,
+    Message,
+    PreCheckoutQuery,
+)
 
-# ========== БЛОКИРОВКА ДЛЯ ПРЕДОТВРАЩЕНИЯ ДВОЙНОГО ЗАПУСКА ==========
-try:
-    lock_file = open('/tmp/bot.lock', 'w')
-    fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-except IOError:
-    print("❌ Bot already running! Exiting...")
-    sys.exit(0)
-except Exception as e:
-    print(f"⚠️ Lock error: {e}")
-
-# ========== НАСТРОЙКА ЛОГГИРОВАНИЯ ==========
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("unity_seller_bot")
 
-# ========== ПРОВЕРКА ПЕРЕМЕННЫХ ==========
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-if not BOT_TOKEN:
-    print("❌ BOT_TOKEN not set!")
-    sys.exit(1)
+# ================== КОНФИГУРАЦИЯ ==================
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+ADMIN_IDS = {
+    int(x.strip())
+    for x in os.getenv("ADMIN_IDS", "").split(",")
+    if x.strip().isdigit()
+}
+DEFAULT_AUTHOR = os.getenv("DEFAULT_AUTHOR", "highlose").strip() or "highlose"
+DATA_DIR = Path(os.getenv("DATA_DIR", ".")).resolve()
+RUB_PROVIDER_TOKEN = os.getenv("RUB_PAYMENT_PROVIDER_TOKEN", "").strip()
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    print("❌ DATABASE_URL not set!")
-    sys.exit(1)
+FILES_DIR = DATA_DIR / "product_files"
+BACKUPS_DIR = DATA_DIR / "backups"
+DB_PATH = DATA_DIR / "shop.db"
+LATEST_SNAPSHOT_PATH = BACKUPS_DIR / "latest_snapshot.db"
+LATEST_JSON_PATH = BACKUPS_DIR / "latest_snapshot.json"
 
-ADMIN_IDS_STR = os.getenv("ADMIN_IDS", "")
-ADMIN_IDS = []
-if ADMIN_IDS_STR:
-    for x in ADMIN_IDS_STR.split(","):
-        try:
-            if x.strip():
-                ADMIN_IDS.append(int(x.strip()))
-        except ValueError:
-            print(f"⚠️ Invalid ADMIN_IDS value: {x}")
-            pass
+for folder in (DATA_DIR, FILES_DIR, BACKUPS_DIR):
+    folder.mkdir(parents=True, exist_ok=True)
 
-# ========== КАНАЛЫ ДЛЯ ПРОВЕРКИ ПОДПИСКИ ==========
-REQUIRED_CHANNELS = [
-    "@Kerrr1337_pub",
-    "@AstraNewsCommunity"
-]
 
-print(f"🤖 Bot starting...")
-print(f"📋 Admin IDs: {ADMIN_IDS}")
-print(f"📢 Required channels: {', '.join(REQUIRED_CHANNELS)}")
+def is_admin(user_id: Optional[int]) -> bool:
+    return user_id is not None and user_id in ADMIN_IDS
 
-if not ADMIN_IDS:
-    print("⚠️ WARNING: No admin IDs set! Some commands will not work.")
 
-# ========== ИНИЦИАЛИЗАЦИЯ ==========
-bot = Bot(token=BOT_TOKEN)
-storage = MemoryStorage()
-dp = Dispatcher(storage=storage)
+# ================== БАЗА ДАННЫХ И АВТОСЕЙФ ==================
+class DatabaseManager:
+    def __init__(self, db_path: Path):
+        self.db_path = db_path
+        self._lock = asyncio.Lock()
 
-# ========== STATES FOR FSM ==========
-class RegistrationStates(StatesGroup):
-    waiting_for_login = State()
-    waiting_for_password = State()
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
 
-class LoginStates(StatesGroup):
-    waiting_for_login = State()
-    waiting_for_password = State()
-
-class ChangelogStates(StatesGroup):
-    waiting_for_changelog = State()
-
-class KeyGenStates(StatesGroup):
-    waiting_for_days = State()
-
-class BanStates(StatesGroup):
-    waiting_for_username = State()
-
-class UnbanStates(StatesGroup):
-    waiting_for_username = State()
-
-# ========== HELPER FUNCTIONS ==========
-def generate_promo_code(length: int = 8) -> str:
-    """
-    Генерирует промокод из заданного количества символов.
-    Использует буквы верхнего регистра и цифры для удобства чтения.
-    Исключает похожие символы: 0, O, 1, I.
-    """
-    characters = string.ascii_uppercase + string.digits
-    # Убираем похожие символы для удобства
-    characters = characters.replace('O', '').replace('0', '').replace('I', '').replace('1', '')
-    
-    # Генерируем код пока не получим уникальный
-    while True:
-        code = ''.join(secrets.choice(characters) for _ in range(length))
-        # Добавляем проверку на повторяющиеся символы для читаемости
-        if len(set(code)) >= length // 2:  # Хотя бы половина символов уникальны
-            return code
-
-async def check_subscription(user_id: int) -> tuple[bool, list[str]]:
-    """
-    Проверяет подписку пользователя на все необходимые каналы.
-    Возвращает (все_подписан, список_неподписанных_каналов)
-    """
-    not_subscribed = []
-    
-    for channel in REQUIRED_CHANNELS:
-        try:
-            # Получаем информацию о членстве в канале
-            chat_member = await bot.get_chat_member(channel, user_id)
-            
-            # Проверяем статус
-            if chat_member.status in ['left', 'kicked']:
-                not_subscribed.append(channel)
-        except Exception as e:
-            logger.error(f"Error checking subscription to {channel}: {e}")
-            # Если бот не может проверить, считаем что пользователь не подписан
-            not_subscribed.append(channel)
-    
-    return len(not_subscribed) == 0, not_subscribed
-
-def get_subscription_keyboard(not_subscribed_channels: list[str]) -> InlineKeyboardMarkup:
-    """Создает клавиатуру с кнопками для подписки на каналы"""
-    buttons = []
-    
-    for channel in not_subscribed_channels:
-        channel_url = f"https://t.me/{channel.replace('@', '')}"
-        buttons.append([InlineKeyboardButton(
-            text=f"📢 Подписаться на {channel}",
-            url=channel_url
-        )])
-    
-    buttons.append([InlineKeyboardButton(
-        text="🔄 Проверить подписку",
-        callback_data="check_subscription"
-    )])
-    
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-def get_main_menu_keyboard(is_admin: bool, is_registered: bool = False) -> ReplyKeyboardMarkup:
-    """Создает основную клавиатуру меню"""
-    buttons = []
-    
-    # Кнопки регистрации/входа
-    if not is_registered:
-        buttons.append([KeyboardButton(text="📝 Регистрация")])
-        buttons.append([KeyboardButton(text="🔑 Войти")])
-    else:
-        buttons.append([KeyboardButton(text="👤 Профиль")])
-        buttons.append([KeyboardButton(text="🔑 Запросить ключ")])
-    
-    # Общие кнопки
-    buttons.append([KeyboardButton(text="📜 Ченжлог")])
-    buttons.append([KeyboardButton(text="📢 Проверить подписки")])
-    
-    # Админские кнопки
-    if is_admin:
-        buttons.extend([
-            [KeyboardButton(text="👥 Все игроки")],
-            [KeyboardButton(text="🔑 Создать ключ")],
-            [KeyboardButton(text="🚫 Бан игрока")],
-            [KeyboardButton(text="✅ Разбан игрока")],
-            [KeyboardButton(text="📝 Добавить в ченжлог")],
-            [KeyboardButton(text="📋 Заявки на ключи")]
-        ])
-    
-    buttons.append([KeyboardButton(text="📋 Меню")])
-    
-    return ReplyKeyboardMarkup(
-        keyboard=buttons,
-        resize_keyboard=True,
-        one_time_keyboard=False
-    )
-
-# ========== MIDDLEWARE ДЛЯ ПРОВЕРКИ ПОДПИСКИ ==========
-class SubscriptionMiddleware:
-    async def __call__(self, handler, event, data):
-        # Пропускаем проверку для администраторов
-        user_id = None
-        
-        if hasattr(event, 'from_user') and event.from_user:
-            user_id = event.from_user.id
-        elif hasattr(event, 'message') and event.message and event.message.from_user:
-            user_id = event.message.from_user.id
-        elif hasattr(event, 'callback_query') and event.callback_query and event.callback_query.from_user:
-            user_id = event.callback_query.from_user.id
-        
-        if not user_id:
-            return await handler(event, data)
-        
-        # Администраторы пропускают проверку
-        if user_id in ADMIN_IDS:
-            return await handler(event, data)
-        
-        # Проверяем подписку
-        is_subscribed, not_subscribed = await check_subscription(user_id)
-        
-        if not is_subscribed and not (hasattr(event, 'data') and event.data == 'check_subscription'):
-            # Если пользователь не подписан, отправляем сообщение
-            keyboard = get_subscription_keyboard(not_subscribed)
-            
-            if hasattr(event, 'answer'):
-                await event.answer()
-                await event.message.answer(
-                    "⚠️ Для использования бота необходимо подписаться на следующие каналы:\n\n"
-                    + "\n".join([f"• {channel}" for channel in not_subscribed]),
-                    reply_markup=keyboard
-                )
-            else:
-                await event.answer(
-                    "⚠️ Для использования бота необходимо подписаться на все каналы!",
-                    reply_markup=keyboard
-                )
-            return
-        
-        # Пользователь подписан или это запрос на проверку
-        return await handler(event, data)
-
-# ========== ИНИЦИАЛИЗАЦИЯ БД С МИГРАЦИЕЙ ==========
-async def init_db():
-    try:
-        conn = await asyncpg.connect(DATABASE_URL)
-        print("✅ Connected to database")
-        
-        # Проверяем существование таблицы users
-        table_exists = await conn.fetchval("""
-            SELECT EXISTS (
-                SELECT 1 FROM information_schema.tables 
-                WHERE table_name = 'users'
-            )
-        """)
-        
-        if not table_exists:
-            # Создаем таблицу с нуля
-            await conn.execute("""
-                CREATE TABLE users (
-                    id SERIAL PRIMARY KEY,
-                    login VARCHAR(50) UNIQUE NOT NULL,
-                    password_hash VARCHAR(255) NOT NULL,
-                    salt VARCHAR(50) NOT NULL,
-                    is_banned BOOLEAN DEFAULT FALSE,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    telegram_id BIGINT UNIQUE
-                )
-            """)
-            print("✅ Table 'users' created")
-        else:
-            # Проверяем наличие колонки telegram_id
-            column_exists = await conn.fetchval("""
-                SELECT EXISTS (
-                    SELECT 1 FROM information_schema.columns 
-                    WHERE table_name = 'users' AND column_name = 'telegram_id'
-                )
-            """)
-            
-            if not column_exists:
-                await conn.execute("""
-                    ALTER TABLE users ADD COLUMN telegram_id BIGINT UNIQUE
-                """)
-                print("✅ Added 'telegram_id' column to users table")
-        
-        # Создаем таблицу keys
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS keys (
-                id SERIAL PRIMARY KEY,
-                key_code VARCHAR(50) UNIQUE NOT NULL,
-                days_valid INTEGER NOT NULL,
-                used_by INTEGER REFERENCES users(id),
-                used_at TIMESTAMP,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                created_by INTEGER REFERENCES users(id),
-                is_active BOOLEAN DEFAULT TRUE
-            )
-        """)
-        
-        # Проверяем наличие колонки created_by в keys
-        column_exists = await conn.fetchval("""
-            SELECT EXISTS (
-                SELECT 1 FROM information_schema.columns 
-                WHERE table_name = 'keys' AND column_name = 'created_by'
-            )
-        """)
-        
-        if not column_exists:
-            await conn.execute("""
-                ALTER TABLE keys ADD COLUMN created_by INTEGER REFERENCES users(id)
-            """)
-            print("✅ Added 'created_by' column to keys table")
-        
-        # Добавляем колонку is_active если её нет
-        column_exists = await conn.fetchval("""
-            SELECT EXISTS (
-                SELECT 1 FROM information_schema.columns 
-                WHERE table_name = 'keys' AND column_name = 'is_active'
-            )
-        """)
-        
-        if not column_exists:
-            await conn.execute("""
-                ALTER TABLE keys ADD COLUMN is_active BOOLEAN DEFAULT TRUE
-            """)
-            print("✅ Added 'is_active' column to keys table")
-        
-        # Создаем остальные таблицы
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS key_requests (
-                id SERIAL PRIMARY KEY,
-                user_id INTEGER REFERENCES users(id),
-                status VARCHAR(20) DEFAULT 'pending',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                processed_at TIMESTAMP,
-                processed_by INTEGER REFERENCES users(id)
-            )
-        """)
-        
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS changelog (
-                id SERIAL PRIMARY KEY,
-                content TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                created_by INTEGER REFERENCES users(id)
-            )
-        """)
-        
-        await conn.close()
-        print("✅ Database initialized successfully!")
-        return True
-    except Exception as e:
-        print(f"❌ Database error: {e}")
-        return False
-
-# ========== HELPER FUNCTIONS ==========
-async def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
-
-async def get_user_by_telegram_id(telegram_id: int, conn):
-    return await conn.fetchrow(
-        "SELECT id, login, is_banned FROM users WHERE telegram_id = $1",
-        telegram_id
-    )
-
-async def get_user_by_login(login: str, conn):
-    return await conn.fetchrow(
-        "SELECT id, login, is_banned, password_hash, salt FROM users WHERE login = $1",
-        login
-    )
-
-async def has_active_key(user_id: int, conn) -> bool:
-    """Проверяет, есть ли у пользователя активный ключ"""
-    result = await conn.fetchval(
-        "SELECT COUNT(*) FROM keys WHERE used_by = $1 AND is_active = TRUE",
-        user_id
-    )
-    return result > 0
-
-async def get_user_active_key(user_id: int, conn) -> Optional[dict]:
-    """Получает активный ключ пользователя"""
-    return await conn.fetchrow(
-        """
-        SELECT id, key_code, days_valid, used_at, is_active
-        FROM keys 
-        WHERE used_by = $1 AND is_active = TRUE
-        ORDER BY used_at DESC 
-        LIMIT 1
-        """,
-        user_id
-    )
-
-async def check_user_registered(telegram_id: int) -> bool:
-    """Проверяет, зарегистрирован ли пользователь"""
-    conn = await asyncpg.connect(DATABASE_URL)
-    try:
-        user = await get_user_by_telegram_id(telegram_id, conn)
-        return user is not None
-    finally:
-        await conn.close()
-
-# ========== COMMANDS ==========
-@dp.message(Command("start"))
-async def start(message: Message):
-    # Проверяем подписку
-    is_subscribed, not_subscribed = await check_subscription(message.from_user.id)
-    
-    if not is_subscribed and message.from_user.id not in ADMIN_IDS:
-        keyboard = get_subscription_keyboard(not_subscribed)
-        await message.answer(
-            "🚀 Добро пожаловать в Astra Key Management Bot!\n\n"
-            "⚠️ Для использования бота необходимо подписаться на все каналы:\n\n"
-            + "\n".join([f"• {channel}" for channel in not_subscribed]) +
-            "\n\nПосле подписки нажмите кнопку 'Проверить подписку'.",
-            reply_markup=keyboard
-        )
-        return
-    
-    is_registered = await check_user_registered(message.from_user.id)
-    
-    await message.answer(
-        "🚀 Astra Key Management Bot\n\n"
-        "Добро пожаловать! Используйте кнопки меню для навигации.\n"
-        "Нажмите '📋 Меню' для просмотра всех доступных функций.",
-        reply_markup=get_main_menu_keyboard(
-            await is_admin(message.from_user.id),
-            is_registered
-        )
-    )
-
-@dp.message(lambda message: message.text == "📋 Меню")
-async def show_menu(message: Message):
-    # Проверяем подписку
-    is_subscribed, not_subscribed = await check_subscription(message.from_user.id)
-    
-    if not is_subscribed and message.from_user.id not in ADMIN_IDS:
-        keyboard = get_subscription_keyboard(not_subscribed)
-        await message.answer(
-            "⚠️ Для использования бота необходимо подписаться на все каналы!\n\n"
-            + "\n".join([f"• {channel}" for channel in not_subscribed]),
-            reply_markup=keyboard
-        )
-        return
-    
-    is_registered = await check_user_registered(message.from_user.id)
-    
-    await message.answer(
-        "📋 Главное меню\n\n"
-        "Выберите действие:",
-        reply_markup=get_main_menu_keyboard(
-            await is_admin(message.from_user.id),
-            is_registered
-        )
-    )
-
-# ========== CHECK SUBSCRIPTION ==========
-@dp.message(lambda message: message.text == "📢 Проверить подписки")
-async def check_subscription_command(message: Message):
-    await message.answer("🔍 Проверяем подписки...")
-    
-    is_subscribed, not_subscribed = await check_subscription(message.from_user.id)
-    
-    if is_subscribed or message.from_user.id in ADMIN_IDS:
-        is_registered = await check_user_registered(message.from_user.id)
-        await message.answer(
-            "✅ Вы подписаны на все необходимые каналы!\n\n"
-            "🚀 Добро пожаловать в Astra Key Management Bot!\n"
-            "Используйте меню для навигации.",
-            reply_markup=get_main_menu_keyboard(
-                await is_admin(message.from_user.id),
-                is_registered
-            )
-        )
-    else:
-        keyboard = get_subscription_keyboard(not_subscribed)
-        await message.answer(
-            "⚠️ Вы не подписаны на следующие каналы:\n\n"
-            + "\n".join([f"• {channel}" for channel in not_subscribed]) +
-            "\n\nПосле подписки нажмите кнопку 'Проверить подписку'.",
-            reply_markup=keyboard
-        )
-
-@dp.callback_query(lambda c: c.data == "check_subscription")
-async def check_subscription_callback(callback: CallbackQuery):
-    await callback.answer("🔍 Проверяем подписки...")
-    
-    is_subscribed, not_subscribed = await check_subscription(callback.from_user.id)
-    
-    if is_subscribed or callback.from_user.id in ADMIN_IDS:
-        is_registered = await check_user_registered(callback.from_user.id)
-        await callback.message.edit_text(
-            "✅ Вы подписаны на все необходимые каналы!\n\n"
-            "🚀 Добро пожаловать в Astra Key Management Bot!\n"
-            "Используйте меню для навигации."
-        )
-        await callback.message.answer(
-            "📋 Главное меню",
-            reply_markup=get_main_menu_keyboard(
-                await is_admin(callback.from_user.id),
-                is_registered
-            )
-        )
-    else:
-        keyboard = get_subscription_keyboard(not_subscribed)
-        await callback.message.edit_text(
-            "⚠️ Вы не подписаны на следующие каналы:\n\n"
-            + "\n".join([f"• {channel}" for channel in not_subscribed]) +
-            "\n\nПосле подписки нажмите кнопку 'Проверить подписку'.",
-            reply_markup=keyboard
-        )
-
-# ========== REGISTRATION ==========
-@dp.message(lambda message: message.text == "📝 Регистрация")
-async def register_command(message: Message, state: FSMContext):
-    # Проверяем подписку
-    is_subscribed, not_subscribed = await check_subscription(message.from_user.id)
-    
-    if not is_subscribed and message.from_user.id not in ADMIN_IDS:
-        keyboard = get_subscription_keyboard(not_subscribed)
-        await message.answer(
-            "⚠️ Для регистрации необходимо подписаться на все каналы!",
-            reply_markup=keyboard
-        )
-        return
-    
-    # Проверяем, не зарегистрирован ли уже пользователь
-    if await check_user_registered(message.from_user.id):
-        await message.answer(
-            "❌ Вы уже зарегистрированы!\n"
-            "Используйте '👤 Профиль' для просмотра данных.",
-            reply_markup=get_main_menu_keyboard(
-                await is_admin(message.from_user.id),
-                True
-            )
-        )
-        return
-    
-    await message.answer("Введите ваш логин:")
-    await state.set_state(RegistrationStates.waiting_for_login)
-
-@dp.message(RegistrationStates.waiting_for_login)
-async def process_login(message: Message, state: FSMContext):
-    await state.update_data(login=message.text)
-    await message.answer("Введите ваш пароль:")
-    await state.set_state(RegistrationStates.waiting_for_password)
-
-@dp.message(RegistrationStates.waiting_for_password)
-async def process_password(message: Message, state: FSMContext):
-    data = await state.get_data()
-    login = data['login']
-    password = message.text
-    
-    salt = secrets.token_hex(16)
-    hash_obj = hashlib.pbkdf2_hmac('sha256', password.encode(), salt.encode(), 100000)
-    password_hash = hash_obj.hex()
-    
-    conn = await asyncpg.connect(DATABASE_URL)
-    try:
-        existing = await conn.fetchrow(
-            "SELECT id FROM users WHERE telegram_id = $1 OR login = $2",
-            message.from_user.id, login
-        )
-        
-        if existing:
-            await message.answer(
-                "❌ Вы уже зарегистрированы или логин занят!\n"
-                "Используйте '/start' для просмотра меню."
-            )
-            await state.clear()
-            return
-        
-        await conn.execute(
-            "INSERT INTO users (login, password_hash, salt, telegram_id) VALUES ($1, $2, $3, $4)",
-            login, password_hash, salt, message.from_user.id
-        )
-        await message.answer(
-            f"✅ Регистрация успешна!\n"
-            f"👤 Логин: {login}\n"
-            f"🔑 Пароль: {password}\n\n"
-            f"⚠️ Сохраните эти данные!\n"
-            f"Теперь вы можете запросить ключ.",
-            reply_markup=get_main_menu_keyboard(
-                await is_admin(message.from_user.id),
-                True
-            )
-        )
-    except asyncpg.exceptions.UniqueViolationError:
-        await message.answer("❌ Пользователь с таким логином уже существует!")
-    except Exception as e:
-        logger.error(f"Registration error: {e}")
-        await message.answer(f"❌ Ошибка при регистрации: {str(e)}")
-    finally:
-        await conn.close()
-        await state.clear()
-
-# ========== LOGIN ==========
-@dp.message(lambda message: message.text == "🔑 Войти")
-async def login_command(message: Message, state: FSMContext):
-    # Проверяем подписку
-    is_subscribed, not_subscribed = await check_subscription(message.from_user.id)
-    
-    if not is_subscribed and message.from_user.id not in ADMIN_IDS:
-        keyboard = get_subscription_keyboard(not_subscribed)
-        await message.answer(
-            "⚠️ Для входа необходимо подписаться на все каналы!",
-            reply_markup=keyboard
-        )
-        return
-    
-    # Проверяем, не зарегистрирован ли уже пользователь
-    if await check_user_registered(message.from_user.id):
-        await message.answer(
-            "❌ Вы уже авторизованы!\n"
-            "Используйте '👤 Профиль' для просмотра данных.",
-            reply_markup=get_main_menu_keyboard(
-                await is_admin(message.from_user.id),
-                True
-            )
-        )
-        return
-    
-    await message.answer("Введите ваш логин:")
-    await state.set_state(LoginStates.waiting_for_login)
-
-@dp.message(LoginStates.waiting_for_login)
-async def process_login_username(message: Message, state: FSMContext):
-    await state.update_data(login=message.text)
-    await message.answer("Введите ваш пароль:")
-    await state.set_state(LoginStates.waiting_for_password)
-
-@dp.message(LoginStates.waiting_for_password)
-async def process_login_password(message: Message, state: FSMContext):
-    data = await state.get_data()
-    login = data['login']
-    password = message.text
-    
-    conn = await asyncpg.connect(DATABASE_URL)
-    try:
-        user = await get_user_by_login(login, conn)
-        
-        if not user:
-            await message.answer("❌ Неверный логин или пароль!")
-            await state.clear()
-            return
-        
-        # Проверяем пароль
-        hash_obj = hashlib.pbkdf2_hmac('sha256', password.encode(), user['salt'].encode(), 100000)
-        password_hash = hash_obj.hex()
-        
-        if password_hash != user['password_hash']:
-            await message.answer("❌ Неверный логин или пароль!")
-            await state.clear()
-            return
-        
-        # Проверяем, не привязан ли уже этот аккаунт к другому телеграму
-        existing_telegram = await conn.fetchrow(
-            "SELECT telegram_id FROM users WHERE login = $1 AND telegram_id IS NOT NULL",
-            login
-        )
-        
-        if existing_telegram and existing_telegram['telegram_id'] != message.from_user.id:
-            await message.answer(
-                "❌ Этот аккаунт уже привязан к другому пользователю Telegram!\n"
-                "Обратитесь к администратору для решения проблемы."
-            )
-            await state.clear()
-            return
-        
-        # Обновляем telegram_id для пользователя
-        await conn.execute(
-            "UPDATE users SET telegram_id = $1 WHERE login = $2",
-            message.from_user.id, login
-        )
-        
-        await message.answer(
-            f"✅ Вы успешно вошли!\n"
-            f"👤 Логин: {login}",
-            reply_markup=get_main_menu_keyboard(
-                await is_admin(message.from_user.id),
-                True
-            )
-        )
-    except Exception as e:
-        logger.error(f"Login error: {e}")
-        await message.answer(f"❌ Ошибка при входе: {str(e)}")
-    finally:
-        await conn.close()
-        await state.clear()
-
-# ========== PROFILE ==========
-@dp.message(lambda message: message.text == "👤 Профиль")
-async def profile_command(message: Message):
-    conn = await asyncpg.connect(DATABASE_URL)
-    try:
-        user = await get_user_by_telegram_id(message.from_user.id, conn)
-        
-        if not user:
-            await message.answer(
-                "❌ Вы не авторизованы!\n"
-                "Используйте кнопку '🔑 Войти' для входа в существующий аккаунт\n"
-                "или '📝 Регистрация' для создания нового.",
-                reply_markup=get_main_menu_keyboard(
-                    await is_admin(message.from_user.id),
-                    False
-                )
-            )
-            return
-        
-        is_admin_user = await is_admin(message.from_user.id)
-        status = "👑 Admin" if is_admin_user else "🎮 Player"
-        ban_status = "🚫 Забанен" if user['is_banned'] else "✅ Активен"
-        
-        # Получаем активный ключ
-        active_key = await get_user_active_key(user['id'], conn)
-        
-        text = f"👤 Профиль\n\n"
-        text += f"Логин: {user['login']}\n"
-        text += f"Статус: {status}\n"
-        text += f"Состояние: {ban_status}\n"
-        
-        if active_key:
-            expiry = active_key['used_at'] + timedelta(days=active_key['days_valid'])
-            days_left = (expiry - datetime.now()).days
-            text += f"\n🔑 Активный ключ: {active_key['key_code']}\n"
-            text += f"📅 Действует до: {expiry.strftime('%d.%m.%Y')}\n"
-            text += f"⏳ Осталось: {max(0, days_left)} дней\n"
-        else:
-            text += f"\n🔑 Нет активного ключа\n"
-            text += f"Нажмите 'Запросить ключ' для получения."
-        
-        await message.answer(
-            text,
-            reply_markup=get_main_menu_keyboard(
-                is_admin_user,
-                True
-            )
-        )
-    except Exception as e:
-        logger.error(f"Profile error: {e}")
-        await message.answer(f"❌ Ошибка: {e}")
-    finally:
-        await conn.close()
-
-# ========== CHANGELOG ==========
-@dp.message(lambda message: message.text == "📜 Ченжлог")
-async def view_changelog_command(message: Message):
-    conn = await asyncpg.connect(DATABASE_URL)
-    try:
-        changelogs = await conn.fetch(
-            "SELECT content, created_at FROM changelog ORDER BY created_at DESC LIMIT 10"
-        )
-        
-        if not changelogs:
-            await message.answer("📭 Ченжлог пока пуст.")
-            return
-        
-        text = "📜 Последние изменения:\n\n"
-        for i, log in enumerate(changelogs, 1):
-            text += f"{i}. {log['content']}\n"
-            text += f"   📅 {log['created_at'].strftime('%d.%m.%Y %H:%M')}\n\n"
-        
-        is_registered = await check_user_registered(message.from_user.id)
-        await message.answer(
-            text,
-            reply_markup=get_main_menu_keyboard(
-                await is_admin(message.from_user.id),
-                is_registered
-            )
-        )
-    except Exception as e:
-        logger.error(f"Changelog error: {e}")
-        await message.answer(f"❌ Ошибка: {e}")
-    finally:
-        await conn.close()
-
-# ========== REQUEST KEY ==========
-@dp.message(lambda message: message.text == "🔑 Запросить ключ")
-async def request_key_command(message: Message):
-    # Проверяем подписку
-    is_subscribed, not_subscribed = await check_subscription(message.from_user.id)
-    
-    if not is_subscribed and message.from_user.id not in ADMIN_IDS:
-        keyboard = get_subscription_keyboard(not_subscribed)
-        await message.answer(
-            "⚠️ Для запроса ключа необходимо подписаться на все каналы!",
-            reply_markup=keyboard
-        )
-        return
-    
-    conn = await asyncpg.connect(DATABASE_URL)
-    try:
-        user = await get_user_by_telegram_id(message.from_user.id, conn)
-        
-        if not user:
-            await message.answer(
-                "❌ Сначала авторизуйтесь!\n"
-                "Используйте кнопку '🔑 Войти' для входа в существующий аккаунт\n"
-                "или '📝 Регистрация' для создания нового.",
-                reply_markup=get_main_menu_keyboard(
-                    await is_admin(message.from_user.id),
-                    False
-                )
-            )
-            return
-        
-        if user['is_banned']:
-            await message.answer("🚫 Вы забанены и не можете запрашивать ключи!")
-            return
-        
-        # Проверяем, есть ли уже активный ключ
-        has_key = await has_active_key(user['id'], conn)
-        if has_key:
-            await message.answer(
-                "❌ У вас уже есть активный ключ!\n"
-                "Один аккаунт может иметь только один активный ключ."
-            )
-            return
-        
-        existing = await conn.fetchrow(
-            "SELECT id FROM key_requests WHERE user_id = $1 AND status = 'pending'",
-            user['id']
-        )
-        
-        if existing:
-            await message.answer("⏳ У вас уже есть активная заявка на получение ключа!")
-            return
-        
-        await conn.execute(
-            "INSERT INTO key_requests (user_id) VALUES ($1)",
-            user['id']
-        )
-        
-        await message.answer(
-            "✅ Заявка на получение ключа отправлена!\n"
-            "Ожидайте решения администратора.",
-            reply_markup=get_main_menu_keyboard(
-                await is_admin(message.from_user.id),
-                True
-            )
-        )
-        
-        for admin_id in ADMIN_IDS:
-            try:
-                await bot.send_message(
-                    admin_id,
-                    f"📨 Новая заявка на ключ!\n"
-                    f"👤 Пользователь: {user['login']}\n"
-                    f"🆔 ID пользователя: {user['id']}"
-                )
-            except Exception as e:
-                logger.error(f"Failed to notify admin {admin_id}: {e}")
-    except Exception as e:
-        logger.error(f"Request key error: {e}")
-        await message.answer(f"❌ Ошибка: {e}")
-    finally:
-        await conn.close()
-
-# ========== ADMIN: VIEW PLAYERS ==========
-@dp.message(lambda message: message.text == "👥 Все игроки")
-async def view_players_command(message: Message):
-    if not await is_admin(message.from_user.id):
-        await message.answer("❌ Недостаточно прав!")
-        return
-    
-    conn = await asyncpg.connect(DATABASE_URL)
-    try:
-        users = await conn.fetch(
-            """
-            SELECT u.id, u.login, u.is_banned, u.created_at, u.telegram_id,
-                   COUNT(k.id) as key_count,
-                   EXISTS(SELECT 1 FROM keys k2 WHERE k2.used_by = u.id AND k2.is_active = TRUE) as has_active_key
-            FROM users u
-            LEFT JOIN keys k ON u.id = k.used_by AND k.is_active = TRUE
-            GROUP BY u.id
-            ORDER BY u.created_at DESC
-            """
-        )
-        
-        if not users:
-            await message.answer("👥 Нет зарегистрированных игроков.")
-            return
-        
-        text = "👥 Все игроки:\n\n"
-        for user in users:
-            status = "🚫" if user['is_banned'] else "✅"
-            key_status = "🔑" if user['has_active_key'] else "❌"
-            reg_date = user['created_at'].strftime('%d.%m.%Y')
-            telegram = f" (TG: {user['telegram_id']})" if user['telegram_id'] else ""
-            text += f"{status} {key_status} {user['login']}{telegram} - {reg_date}\n"
-        
-        await message.answer(
-            text,
-            reply_markup=get_main_menu_keyboard(True, True)
-        )
-    except Exception as e:
-        logger.error(f"View players error: {e}")
-        await message.answer(f"❌ Ошибка: {e}")
-    finally:
-        await conn.close()
-
-# ========== ADMIN: CREATE KEY ==========
-@dp.message(lambda message: message.text == "🔑 Создать ключ")
-async def create_key_command(message: Message, state: FSMContext):
-    if not await is_admin(message.from_user.id):
-        await message.answer("❌ Недостаточно прав!")
-        return
-    
-    await message.answer(
-        "Введите количество дней действия ключа (число):\n"
-        "Пример: 30"
-    )
-    await state.set_state(KeyGenStates.waiting_for_days)
-
-@dp.message(KeyGenStates.waiting_for_days)
-async def process_key_days(message: Message, state: FSMContext):
-    if not await is_admin(message.from_user.id):
-        await message.answer("❌ Недостаточно прав!")
-        await state.clear()
-        return
-    
-    try:
-        days = int(message.text)
-        if days <= 0:
-            await message.answer("❌ Количество дней должно быть положительным числом!")
-            return
-    except ValueError:
-        await message.answer("❌ Введите корректное число!")
-        return
-    
-    # Генерируем 8-символьный промокод
-    key_code = generate_promo_code(8)
-    
-    conn = await asyncpg.connect(DATABASE_URL)
-    try:
-        # Проверяем уникальность ключа
-        existing = await conn.fetchrow(
-            "SELECT id FROM keys WHERE key_code = $1",
-            key_code
-        )
-        
-        # Если ключ уже существует, генерируем новый
-        while existing:
-            key_code = generate_promo_code(8)
-            existing = await conn.fetchrow(
-                "SELECT id FROM keys WHERE key_code = $1",
-                key_code
-            )
-        
-        user = await get_user_by_telegram_id(message.from_user.id, conn)
-        
-        if user:
-            await conn.execute(
-                "INSERT INTO keys (key_code, days_valid, created_by, is_active) VALUES ($1, $2, $3, TRUE)",
-                key_code, days, user['id']
-            )
-        else:
-            await conn.execute(
-                "INSERT INTO keys (key_code, days_valid, is_active) VALUES ($1, $2, TRUE)",
-                key_code, days
-            )
-        
-        await message.answer(
-            f"✅ Ключ создан!\n\n"
-            f"🔑 `{key_code}`\n"
-            f"📅 Действует {days} дней\n\n"
-            f"💡 Ключ состоит из 8 символов (буквы и цифры)\n"
-            f"Пример: A7B3C9D2",
-            parse_mode="Markdown",
-            reply_markup=get_main_menu_keyboard(True, True)
-        )
-    except Exception as e:
-        logger.error(f"Gen key error: {e}")
-        await message.answer(f"❌ Ошибка: {e}")
-    finally:
-        await conn.close()
-        await state.clear()
-
-# ========== ADMIN: BAN ==========
-@dp.message(lambda message: message.text == "🚫 Бан игрока")
-async def ban_player_command(message: Message, state: FSMContext):
-    if not await is_admin(message.from_user.id):
-        await message.answer("❌ Недостаточно прав!")
-        return
-    
-    await message.answer("Введите логин игрока для бана:")
-    await state.set_state(BanStates.waiting_for_username)
-
-@dp.message(BanStates.waiting_for_username)
-async def process_ban_user(message: Message, state: FSMContext):
-    if not await is_admin(message.from_user.id):
-        await message.answer("❌ Недостаточно прав!")
-        await state.clear()
-        return
-    
-    login = message.text.strip()
-    if not login:
-        await message.answer("❌ Введите логин!")
-        return
-    
-    conn = await asyncpg.connect(DATABASE_URL)
-    try:
-        user = await get_user_by_login(login, conn)
-        
-        if not user:
-            await message.answer(f"❌ Игрок {login} не найден!")
-            await state.clear()
-            return
-        
-        if user['is_banned']:
-            await message.answer(f"ℹ️ Игрок {login} уже забанен!")
-            await state.clear()
-            return
-        
-        await conn.execute(
-            "UPDATE users SET is_banned = TRUE WHERE login = $1",
-            login
-        )
-        
-        # Деактивируем все ключи пользователя
-        await conn.execute(
-            "UPDATE keys SET is_active = FALSE WHERE used_by = $1",
-            user['id']
-        )
-        
-        await message.answer(
-            f"🚫 Игрок {login} забанен!\n"
-            f"Все его ключи деактивированы.",
-            reply_markup=get_main_menu_keyboard(True, True)
-        )
-        
-        # Уведомляем пользователя
-        user_data = await conn.fetchrow(
-            "SELECT telegram_id FROM users WHERE login = $1",
-            login
-        )
-        if user_data and user_data['telegram_id']:
-            try:
-                await bot.send_message(
-                    user_data['telegram_id'],
-                    f"🚫 Вы были забанены администратором!\n"
-                    f"Все ваши ключи деактивированы."
-                )
-            except:
-                pass
-    except Exception as e:
-        logger.error(f"Ban error: {e}")
-        await message.answer(f"❌ Ошибка: {e}")
-    finally:
-        await conn.close()
-        await state.clear()
-
-# ========== ADMIN: UNBAN ==========
-@dp.message(lambda message: message.text == "✅ Разбан игрока")
-async def unban_player_command(message: Message, state: FSMContext):
-    if not await is_admin(message.from_user.id):
-        await message.answer("❌ Недостаточно прав!")
-        return
-    
-    await message.answer("Введите логин игрока для разбана:")
-    await state.set_state(UnbanStates.waiting_for_username)
-
-@dp.message(UnbanStates.waiting_for_username)
-async def process_unban_user(message: Message, state: FSMContext):
-    if not await is_admin(message.from_user.id):
-        await message.answer("❌ Недостаточно прав!")
-        await state.clear()
-        return
-    
-    login = message.text.strip()
-    if not login:
-        await message.answer("❌ Введите логин!")
-        return
-    
-    conn = await asyncpg.connect(DATABASE_URL)
-    try:
-        user = await get_user_by_login(login, conn)
-        
-        if not user:
-            await message.answer(f"❌ Игрок {login} не найден!")
-            await state.clear()
-            return
-        
-        if not user['is_banned']:
-            await message.answer(f"ℹ️ Игрок {login} не забанен!")
-            await state.clear()
-            return
-        
-        await conn.execute(
-            "UPDATE users SET is_banned = FALSE WHERE login = $1",
-            login
-        )
-        
-        await message.answer(
-            f"✅ Игрок {login} разбанен!",
-            reply_markup=get_main_menu_keyboard(True, True)
-        )
-        
-        # Уведомляем пользователя
-        user_data = await conn.fetchrow(
-            "SELECT telegram_id FROM users WHERE login = $1",
-            login
-        )
-        if user_data and user_data['telegram_id']:
-            try:
-                await bot.send_message(
-                    user_data['telegram_id'],
-                    f"✅ Вы были разбанены администратором!"
-                )
-            except:
-                pass
-    except Exception as e:
-        logger.error(f"Unban error: {e}")
-        await message.answer(f"❌ Ошибка: {e}")
-    finally:
-        await conn.close()
-        await state.clear()
-
-# ========== ADMIN: ADD CHANGELOG ==========
-@dp.message(lambda message: message.text == "📝 Добавить в ченжлог")
-async def add_changelog_command(message: Message, state: FSMContext):
-    if not await is_admin(message.from_user.id):
-        await message.answer("❌ Недостаточно прав!")
-        return
-    
-    await message.answer(
-        "Введите текст новости для ченжлога:\n"
-        "Пример: Добавлена новая функция X"
-    )
-    await state.set_state(ChangelogStates.waiting_for_changelog)
-
-@dp.message(ChangelogStates.waiting_for_changelog)
-async def process_changelog(message: Message, state: FSMContext):
-    if not await is_admin(message.from_user.id):
-        await message.answer("❌ Недостаточно прав!")
-        await state.clear()
-        return
-    
-    content = message.text.strip()
-    if not content:
-        await message.answer("❌ Текст не может быть пустым!")
-        return
-    
-    conn = await asyncpg.connect(DATABASE_URL)
-    try:
-        user = await get_user_by_telegram_id(message.from_user.id, conn)
-        
-        if user:
-            await conn.execute(
-                "INSERT INTO changelog (content, created_by) VALUES ($1, $2)",
-                content, user['id']
-            )
-        else:
-            await conn.execute(
-                "INSERT INTO changelog (content) VALUES ($1)",
-                content
-            )
-        
-        await message.answer(
-            f"✅ Новость добавлена в ченжлог!\n\n"
-            f"📝 {content}",
-            reply_markup=get_main_menu_keyboard(True, True)
-        )
-    except Exception as e:
-        logger.error(f"Add changelog error: {e}")
-        await message.answer(f"❌ Ошибка: {e}")
-    finally:
-        await conn.close()
-        await state.clear()
-
-# ========== ADMIN: VIEW REQUESTS ==========
-@dp.message(lambda message: message.text == "📋 Заявки на ключи")
-async def view_requests_command(message: Message):
-    if not await is_admin(message.from_user.id):
-        await message.answer("❌ Недостаточно прав!")
-        return
-    
-    conn = await asyncpg.connect(DATABASE_URL)
-    try:
-        requests = await conn.fetch(
-            """
-            SELECT kr.id, kr.user_id, u.login, u.is_banned, kr.created_at
-            FROM key_requests kr
-            JOIN users u ON kr.user_id = u.id
-            WHERE kr.status = 'pending'
-            ORDER BY kr.created_at ASC
-            """
-        )
-        
-        if not requests:
-            await message.answer("📋 Нет активных заявок на ключи.")
-            return
-        
-        text = "📋 Активные заявки:\n\n"
-        for req in requests:
-            status = "🚫" if req['is_banned'] else "✅"
-            text += f"🆔 ID: {req['id']}\n"
-            text += f"👤 {req['login']} {status}\n"
-            text += f"📅 {req['created_at'].strftime('%d.%m.%Y %H:%M')}\n"
-            text += f"---\n"
-        
-        await message.answer(
-            text,
-            reply_markup=get_request_keyboard()
-        )
-    except Exception as e:
-        logger.error(f"View requests error: {e}")
-        await message.answer(f"❌ Ошибка: {e}")
-    finally:
-        await conn.close()
-
-# ========== ADMIN: PROCESS KEY REQUEST ==========
-@dp.callback_query(lambda c: c.data in ["approve_key", "reject_key"])
-async def process_key_request(callback: CallbackQuery):
-    if not await is_admin(callback.from_user.id):
-        await callback.answer("❌ Недостаточно прав!", show_alert=True)
-        return
-    
-    conn = await asyncpg.connect(DATABASE_URL)
-    try:
-        # Получаем первую активную заявку
-        request = await conn.fetchrow(
-            """
-            SELECT kr.id, kr.user_id, u.login, u.telegram_id
-            FROM key_requests kr
-            JOIN users u ON kr.user_id = u.id
-            WHERE kr.status = 'pending'
-            ORDER BY kr.created_at ASC
-            LIMIT 1
-            """
-        )
-        
-        if not request:
-            await callback.message.answer("❌ Нет активных заявок!")
-            await callback.answer()
-            return
-        
-        admin = await get_user_by_telegram_id(callback.from_user.id, conn)
-        
-        if callback.data == "approve_key":
-            # Проверяем, нет ли уже активного ключа у пользователя
-            has_key = await has_active_key(request['user_id'], conn)
-            if has_key:
-                await callback.message.answer(
-                    f"❌ У пользователя {request['login']} уже есть активный ключ!\n"
-                    "Один аккаунт = один ключ."
-                )
-                await callback.answer()
-                return
-            
-            # Генерируем 8-символьный промокод
-            key_code = generate_promo_code(8)
-            
-            # Проверяем уникальность ключа
-            existing = await conn.fetchrow(
-                "SELECT id FROM keys WHERE key_code = $1",
-                key_code
-            )
-            
-            while existing:
-                key_code = generate_promo_code(8)
-                existing = await conn.fetchrow(
-                    "SELECT id FROM keys WHERE key_code = $1",
-                    key_code
-                )
-            
-            await conn.execute(
+    def init_schema(self) -> None:
+        with self._connect() as conn:
+            conn.execute(
                 """
-                INSERT INTO keys (key_code, days_valid, used_by, used_at, is_active) 
-                VALUES ($1, $2, $3, $4, TRUE)
-                """,
-                key_code, 30, request['user_id'], datetime.now()
+                CREATE TABLE IF NOT EXISTS products (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    author TEXT NOT NULL,
+                    photo_file_id TEXT NOT NULL,
+                    file_path TEXT NOT NULL,
+                    original_filename TEXT NOT NULL,
+                    price_stars INTEGER NOT NULL DEFAULT 0,
+                    price_rub INTEGER NOT NULL DEFAULT 0,
+                    is_active INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL
+                )
+                """
             )
-            
-            await conn.execute(
-                "UPDATE key_requests SET status = 'approved', processed_at = NOW(), processed_by = $1 WHERE id = $2",
-                admin['id'] if admin else None, request['id']
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS orders (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    username TEXT,
+                    product_id INTEGER NOT NULL,
+                    currency TEXT NOT NULL,
+                    amount INTEGER NOT NULL,
+                    telegram_charge_id TEXT,
+                    created_at TEXT NOT NULL
+                )
+                """
             )
-            
-            await callback.message.answer(
-                f"✅ Заявка одобрена!\n"
-                f"🔑 Ключ: `{key_code}`\n"
-                f"👤 Пользователь: {request['login']}\n"
-                f"📅 Действует 30 дней\n"
-                f"💡 Ключ состоит из 8 символов",
-                parse_mode="Markdown"
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+                """
             )
-            
-            # Отправляем ключ пользователю
-            if request['telegram_id']:
-                try:
-                    await bot.send_message(
-                        request['telegram_id'],
-                        f"✅ Ваша заявка на ключ одобрена!\n\n"
-                        f"🔑 Ключ: `{key_code}`\n"
-                        f"📅 Действует 30 дней\n"
-                        f"Используйте ключ для активации.",
-                        parse_mode="Markdown"
-                    )
-                except Exception as e:
-                    logger.error(f"Failed to send key to user: {e}")
-        else:
-            await conn.execute(
-                "UPDATE key_requests SET status = 'rejected', processed_at = NOW(), processed_by = $1 WHERE id = $2",
-                admin['id'] if admin else None, request['id']
-            )
-            
-            await callback.message.answer(f"❌ Заявка пользователя {request['login']} отклонена.")
-            
-            if request['telegram_id']:
-                try:
-                    await bot.send_message(
-                        request['telegram_id'],
-                        "❌ Ваша заявка на ключ отклонена администратором."
-                    )
-                except Exception as e:
-                    logger.error(f"Failed to notify user: {e}")
-        
-    except Exception as e:
-        logger.error(f"Process request error: {e}")
-        await callback.message.answer(f"❌ Ошибка: {e}")
-    finally:
-        await conn.close()
-        await callback.answer()
+            conn.commit()
 
-# ========== ЗАПУСК ==========
-async def main():
-    print("🚀 Starting bot...")
-    
-    if not await init_db():
-        print("❌ Failed to initialize database!")
-        return
-    
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            await bot.delete_webhook(drop_pending_updates=True)
-            print("✅ Webhook cleared")
-            break
-        except Exception as e:
-            print(f"⚠️ Webhook error (attempt {attempt + 1}/{max_retries}): {e}")
-            if attempt < max_retries - 1:
-                await asyncio.sleep(2)
-    
-    try:
-        me = await bot.get_me()
-        print(f"✅ Bot connected: @{me.username} (ID: {me.id})")
-    except Exception as e:
-        print(f"❌ Failed to connect to Telegram: {e}")
-        return
-    
-    print("🤖 Bot is running...")
-    print(f"📢 Checking subscriptions to: {', '.join(REQUIRED_CHANNELS)}")
-    
-    while True:
-        try:
-            await dp.start_polling(
-                bot,
-                skip_updates=True,
-                allowed_updates=["message", "callback_query"]
+    def restore_if_needed(self) -> str:
+        """
+        При старте проверяет БД:
+        - если основной файл БД отсутствует или повреждён/пуст, восстанавливает из latest_snapshot.db;
+        - если основной файл есть, фиксирует метку старта и создаёт свежий снапшот.
+        """
+        db_exists = self.db_path.exists() and self.db_path.stat().st_size > 0
+        snapshot_exists = (
+            LATEST_SNAPSHOT_PATH.exists() and LATEST_SNAPSHOT_PATH.stat().st_size > 0
+        )
+
+        if not db_exists and snapshot_exists:
+            shutil.copy2(LATEST_SNAPSHOT_PATH, self.db_path)
+            self.init_schema()
+            self._set_meta("last_restore", datetime.utcnow().isoformat())
+            return "restored_from_snapshot"
+
+        if db_exists:
+            try:
+                self.init_schema()
+                with self._connect() as conn:
+                    conn.execute("SELECT COUNT(*) FROM products").fetchone()
+            except sqlite3.DatabaseError:
+                if snapshot_exists:
+                    corrupted = self.db_path.with_suffix(".corrupted.db")
+                    shutil.move(self.db_path, corrupted)
+                    shutil.copy2(LATEST_SNAPSHOT_PATH, self.db_path)
+                    self.init_schema()
+                    return "recovered_from_corrupted_db"
+                raise
+
+        self.init_schema()
+        self._set_meta("last_boot", datetime.utcnow().isoformat())
+        self.save_snapshot_sync()
+        return "initialized_and_saved"
+
+    def _set_meta(self, key: str, value: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO meta (key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (key, value),
             )
-        except Exception as e:
-            logger.error(f"Polling error: {e}")
-            print(f"⚠️ Polling crashed, restarting in 5 seconds...")
-            await asyncio.sleep(5)
-            continue
+            conn.commit()
+
+    def save_snapshot_sync(self) -> None:
+        """Безопасно сохраняет консистентный снапшот SQLite через SQLite backup API + JSON."""
+        if not self.db_path.exists():
+            return
+        now_iso = datetime.utcnow().isoformat()
+        self._set_meta("last_autosave", now_iso)
+
+        with self._connect() as src:
+            dst = sqlite3.connect(LATEST_SNAPSHOT_PATH)
+            try:
+                src.backup(dst)
+            finally:
+                dst.close()
+
+            products = [dict(r) for r in src.execute("SELECT * FROM products ORDER BY id")]
+            orders = [dict(r) for r in src.execute("SELECT * FROM orders ORDER BY id")]
+
+        payload = {
+            "saved_at": now_iso,
+            "products": products,
+            "orders": orders,
+        }
+        tmp_json = LATEST_JSON_PATH.with_suffix(".tmp")
+        tmp_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp_json.replace(LATEST_JSON_PATH)
+
+    async def autosave(self) -> None:
+        async with self._lock:
+            await asyncio.to_thread(self.save_snapshot_sync)
+
+    async def add_product(
+        self,
+        title: str,
+        description: str,
+        author: str,
+        photo_file_id: str,
+        file_path: str,
+        original_filename: str,
+        price_stars: int,
+        price_rub: int,
+    ) -> int:
+        async with self._lock:
+            def _insert() -> int:
+                with self._connect() as conn:
+                    cur = conn.execute(
+                        """
+                        INSERT INTO products (
+                            title, description, author, photo_file_id,
+                            file_path, original_filename, price_stars,
+                            price_rub, is_active, created_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+                        """,
+                        (
+                            title,
+                            description,
+                            author,
+                            photo_file_id,
+                            file_path,
+                            original_filename,
+                            price_stars,
+                            price_rub,
+                            datetime.utcnow().isoformat(),
+                        ),
+                    )
+                    conn.commit()
+                    product_id = int(cur.lastrowid)
+                self.save_snapshot_sync()
+                return product_id
+
+            return await asyncio.to_thread(_insert)
+
+    async def get_active_products(self) -> List[Dict[str, Any]]:
+        async with self._lock:
+            def _query() -> List[Dict[str, Any]]:
+                with self._connect() as conn:
+                    rows = conn.execute(
+                        "SELECT * FROM products WHERE is_active = 1 ORDER BY id ASC"
+                    ).fetchall()
+                return [dict(r) for r in rows]
+
+            return await asyncio.to_thread(_query)
+
+    async def get_all_products(self) -> List[Dict[str, Any]]:
+        async with self._lock:
+            def _query() -> List[Dict[str, Any]]:
+                with self._connect() as conn:
+                    rows = conn.execute("SELECT * FROM products ORDER BY id ASC").fetchall()
+                return [dict(r) for r in rows]
+
+            return await asyncio.to_thread(_query)
+
+    async def get_product(self, product_id: int) -> Optional[Dict[str, Any]]:
+        async with self._lock:
+            def _query() -> Optional[Dict[str, Any]]:
+                with self._connect() as conn:
+                    row = conn.execute(
+                        "SELECT * FROM products WHERE id = ?", (product_id,)
+                    ).fetchone()
+                return dict(row) if row else None
+
+            return await asyncio.to_thread(_query)
+
+    async def update_prices(
+        self, product_id: int, price_stars: int, price_rub: int
+    ) -> bool:
+        async with self._lock:
+            def _update() -> bool:
+                with self._connect() as conn:
+                    cur = conn.execute(
+                        """
+                        UPDATE products
+                        SET price_stars = ?, price_rub = ?
+                        WHERE id = ?
+                        """,
+                        (price_stars, price_rub, product_id),
+                    )
+                    conn.commit()
+                    changed = cur.rowcount > 0
+                if changed:
+                    self.save_snapshot_sync()
+                return changed
+
+            return await asyncio.to_thread(_update)
+
+    async def toggle_active(self, product_id: int) -> Optional[int]:
+        async with self._lock:
+            def _toggle() -> Optional[int]:
+                with self._connect() as conn:
+                    row = conn.execute(
+                        "SELECT is_active FROM products WHERE id = ?", (product_id,)
+                    ).fetchone()
+                    if not row:
+                        return None
+                    new_state = 0 if int(row["is_active"]) == 1 else 1
+                    conn.execute(
+                        "UPDATE products SET is_active = ? WHERE id = ?",
+                        (new_state, product_id),
+                    )
+                    conn.commit()
+                self.save_snapshot_sync()
+                return new_state
+
+            return await asyncio.to_thread(_toggle)
+
+    async def delete_product(self, product_id: int) -> Optional[Dict[str, Any]]:
+        async with self._lock:
+            def _delete() -> Optional[Dict[str, Any]]:
+                with self._connect() as conn:
+                    row = conn.execute(
+                        "SELECT * FROM products WHERE id = ?", (product_id,)
+                    ).fetchone()
+                    if not row:
+                        return None
+                    prod = dict(row)
+                    conn.execute("DELETE FROM products WHERE id = ?", (product_id,))
+                    conn.commit()
+                self.save_snapshot_sync()
+                return prod
+
+            return await asyncio.to_thread(_delete)
+
+    async def record_order(
+        self,
+        user_id: int,
+        username: Optional[str],
+        product_id: int,
+        currency: str,
+        amount: int,
+        telegram_charge_id: str,
+    ) -> int:
+        async with self._lock:
+            def _insert() -> int:
+                with self._connect() as conn:
+                    cur = conn.execute(
+                        """
+                        INSERT INTO orders (
+                            user_id, username, product_id, currency,
+                            amount, telegram_charge_id, created_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            user_id,
+                            username or "",
+                            product_id,
+                            currency,
+                            amount,
+                            telegram_charge_id,
+                            datetime.utcnow().isoformat(),
+                        ),
+                    )
+                    conn.commit()
+                    order_id = int(cur.lastrowid)
+                self.save_snapshot_sync()
+                return order_id
+
+            return await asyncio.to_thread(_insert)
+
+    async def get_stats(self) -> Dict[str, Any]:
+        async with self._lock:
+            def _stats() -> Dict[str, Any]:
+                with self._connect() as conn:
+                    total_products = conn.execute(
+                        "SELECT COUNT(*) FROM products"
+                    ).fetchone()[0]
+                    active_products = conn.execute(
+                        "SELECT COUNT(*) FROM products WHERE is_active = 1"
+                    ).fetchone()[0]
+                    total_orders = conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
+                    stars_sum = conn.execute(
+                        "SELECT COALESCE(SUM(amount), 0) FROM orders WHERE currency = 'XTR'"
+                    ).fetchone()[0]
+                    rub_sum = conn.execute(
+                        "SELECT COALESCE(SUM(amount), 0) FROM orders WHERE currency = 'RUB'"
+                    ).fetchone()[0]
+                    meta_rows = {
+                        r["key"]: r["value"]
+                        for r in conn.execute("SELECT key, value FROM meta").fetchall()
+                    }
+                return {
+                    "total_products": total_products,
+                    "active_products": active_products,
+                    "total_orders": total_orders,
+                    "stars_sum": stars_sum,
+                    "rub_sum": rub_sum,
+                    "last_autosave": meta_rows.get("last_autosave", "—"),
+                }
+
+            return await asyncio.to_thread(_stats)
+
+
+db = DatabaseManager(DB_PATH)
+
+
+# ================== FSM СОСТОЯНИЯ ==================
+class AddProductFSM(StatesGroup):
+    photo = State()
+    title = State()
+    description = State()
+    author = State()
+    price_stars = State()
+    price_rub = State()
+    file = State()
+
+
+class EditPriceFSM(StatesGroup):
+    price_stars = State()
+    price_rub = State()
+
+
+# ================== КЛАВИАТУРЫ И ФОРМАТИРОВАНИЕ ==================
+def main_menu_kb(user_id: int) -> InlineKeyboardMarkup:
+    rows: List[List[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(
+                text="🛍 Витрина Unity-проектов", callback_data="showcase:0"
+            )
+        ]
+    ]
+    if is_admin(user_id):
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="➕ Добавить проект", callback_data="admin:add_product"
+                ),
+                InlineKeyboardButton(
+                    text="⚙️ Управление товарами", callback_data="admin:products:0"
+                ),
+            ]
+        )
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="📊 Статистика", callback_data="admin:stats"
+                ),
+                InlineKeyboardButton(
+                    text="💾 Сохранить сейчас", callback_data="admin:force_save"
+                ),
+            ]
+        )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def cancel_kb(back_cb: str = "menu:main") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data=back_cb)]
+        ]
+    )
+
+
+def format_prices(product: Dict[str, Any]) -> str:
+    parts: List[str] = []
+    stars = int(product.get("price_stars") or 0)
+    rub = int(product.get("price_rub") or 0)
+    if stars > 0:
+        parts.append(f"⭐️ <b>{stars}</b> звёзд")
+    if rub > 0:
+        parts.append(f"₽ <b>{rub}</b> руб.")
+    return " / ".join(parts) if parts else "Цена не указана"
+
+
+def format_product_card(product: Dict[str, Any], idx: int, total: int) -> str:
+    return (
+        f"📦 <b>{product['title']}</b> ({idx + 1}/{total})\n"
+        f"👤 <b>Автор:</b> {product['author']}\n"
+        f"💰 <b>Цена:</b> {format_prices(product)}\n\n"
+        f"{product['description']}"
+    )
+
+
+def showcase_kb(product: Dict[str, Any], idx: int, total: int) -> InlineKeyboardMarkup:
+    rows: List[List[InlineKeyboardButton]] = []
+    pay_row: List[InlineKeyboardButton] = []
+    if int(product.get("price_stars") or 0) > 0:
+        pay_row.append(
+            InlineKeyboardButton(
+                text=f"Купить за {product['price_stars']} ⭐️",
+                callback_data=f"buy:stars:{product['id']}:{idx}",
+            )
+        )
+    if int(product.get("price_rub") or 0) > 0:
+        pay_row.append(
+            InlineKeyboardButton(
+                text=f"Купить за {product['price_rub']} ₽",
+                callback_data=f"buy:rub:{product['id']}:{idx}",
+            )
+        )
+    if pay_row:
+        rows.append(pay_row)
+
+    nav_row: List[InlineKeyboardButton] = []
+    if total > 1:
+        prev_idx = (idx - 1) % total
+        next_idx = (idx + 1) % total
+        nav_row.append(
+            InlineKeyboardButton(text="◀️ Назад", callback_data=f"showcase:{prev_idx}")
+        )
+        nav_row.append(
+            InlineKeyboardButton(text="Далее ▶️", callback_data=f"showcase:{next_idx}")
+        )
+        rows.append(nav_row)
+
+    rows.append(
+        [InlineKeyboardButton(text="🏠 В меню", callback_data="menu:main")]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_product_manage_kb(
+    product: Dict[str, Any], idx: int, total: int
+) -> InlineKeyboardMarkup:
+    status_label = "🟢 Активен (скрыть)" if product["is_active"] else "🔴 Скрыт (показать)"
+    rows: List[List[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(
+                text="✏️ Изменить цену",
+                callback_data=f"admin:edit_price:{product['id']}:{idx}",
+            ),
+            InlineKeyboardButton(
+                text=status_label,
+                callback_data=f"admin:toggle:{product['id']}:{idx}",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text="🗑 Удалить проект",
+                callback_data=f"admin:delete:{product['id']}:{idx}",
+            )
+        ],
+    ]
+    if total > 1:
+        prev_idx = (idx - 1) % total
+        next_idx = (idx + 1) % total
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="◀️ Пред.", callback_data=f"admin:products:{prev_idx}"
+                ),
+                InlineKeyboardButton(
+                    text="След. ▶️", callback_data=f"admin:products:{next_idx}"
+                ),
+            ]
+        )
+    rows.append([InlineKeyboardButton(text="🏠 В меню", callback_data="menu:main")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# ================== РОУТЕР И ХЭНДЛЕРЫ ==================
+router = Router()
+
+
+@router.message(CommandStart())
+async def cmd_start(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    role_note = "\n🛠 Режим администратора активен." if is_admin(message.from_user.id) else ""
+    await message.answer(
+        f"Привет! Это витрина Unity-проектов от <b>{DEFAULT_AUTHOR}</b>.{role_note}\n\n"
+        "Выбери действие в меню ниже:",
+        reply_markup=main_menu_kb(message.from_user.id),
+    )
+
+
+@router.message(Command("cancel"))
+async def cmd_cancel(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer(
+        "Действие отменено.", reply_markup=main_menu_kb(message.from_user.id)
+    )
+
+
+@router.callback_query(F.data == "menu:main")
+async def cb_main_menu(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    text = (
+        f"Главное меню витрины <b>{DEFAULT_AUTHOR}</b>.\n"
+        "Листай проекты, выбирай оплату в ⭐️ или ₽ и получай файл сразу после оплаты."
+    )
+    if callback.message.photo:
+        await callback.message.delete()
+        await callback.message.answer(
+            text, reply_markup=main_menu_kb(callback.from_user.id)
+        )
+    else:
+        await callback.message.edit_text(
+            text, reply_markup=main_menu_kb(callback.from_user.id)
+        )
+    await callback.answer()
+
+
+# ---------- ВИТРИНА ПОКУПАТЕЛЯ ----------
+async def _render_showcase_page(
+    target_message: Message, idx: int, edit_existing: bool = False
+) -> None:
+    products = await db.get_active_products()
+    if not products:
+        empty_text = "Пока в витрине нет активных проектов. Загляни позже!"
+        if edit_existing and not target_message.photo:
+            await target_message.edit_text(
+                empty_text,
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [InlineKeyboardButton(text="🏠 В меню", callback_data="menu:main")]
+                    ]
+                ),
+            )
+        else:
+            if edit_existing and target_message.photo:
+                await target_message.delete()
+            await target_message.answer(
+                empty_text,
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [InlineKeyboardButton(text="🏠 В меню", callback_data="menu:main")]
+                    ]
+                ),
+            )
+        return
+
+    safe_idx = idx % len(products)
+    product = products[safe_idx]
+    caption = format_product_card(product, safe_idx, len(products))
+    kb = showcase_kb(product, safe_idx, len(products))
+
+    if edit_existing and target_message.photo:
+        from aiogram.types import InputMediaPhoto
+
+        await target_message.edit_media(
+            media=InputMediaPhoto(media=product["photo_file_id"], caption=caption),
+            reply_markup=kb,
+        )
+    else:
+        if edit_existing:
+            await target_message.delete()
+        await target_message.answer_photo(
+            photo=product["photo_file_id"], caption=caption, reply_markup=kb
+        )
+
+
+@router.callback_query(F.data.startswith("showcase:"))
+async def cb_showcase(callback: CallbackQuery) -> None:
+    idx = int(callback.data.split(":")[1])
+    await _render_showcase_page(callback.message, idx=idx, edit_existing=True)
+    await callback.answer()
+
+
+# ---------- ОПЛАТА (TELEGRAM STARS И РУБЛИ) ----------
+@router.callback_query(F.data.startswith("buy:"))
+async def cb_buy(callback: CallbackQuery, bot: Bot) -> None:
+    _, currency_mode, prod_id_str, _ = callback.data.split(":")
+    product = await db.get_product(int(prod_id_str))
+    if not product or not product["is_active"]:
+        await callback.answer("Товар недоступен.", show_alert=True)
+        return
+
+    payload = f"order:{product['id']}:{currency_mode}:{callback.from_user.id}"
+
+    if currency_mode == "stars":
+        stars_amount = int(product["price_stars"])
+        if stars_amount <= 0:
+            await callback.answer("Оплата звёздами не задана.", show_alert=True)
+            return
+        await bot.send_invoice(
+            chat_id=callback.from_user.id,
+            title=product["title"][:32],
+            description=product["description"][:255],
+            payload=payload,
+            currency="XTR",
+            prices=[LabeledPrice(label=product["title"][:32], amount=stars_amount)],
+        )
+        await callback.answer("Счёт на оплату звёздами отправлен.")
+        return
+
+    if currency_mode == "rub":
+        rub_amount = int(product["price_rub"])
+        if rub_amount <= 0:
+            await callback.answer("Оплата в рублях не задана.", show_alert=True)
+            return
+        if not RUB_PROVIDER_TOKEN:
+            await callback.answer(
+                "Оплата в рублях пока не подключена (укажи RUB_PAYMENT_PROVIDER_TOKEN).",
+                show_alert=True,
+            )
+            return
+        await bot.send_invoice(
+            chat_id=callback.from_user.id,
+            title=product["title"][:32],
+            description=product["description"][:255],
+            payload=payload,
+            provider_token=RUB_PROVIDER_TOKEN,
+            currency="RUB",
+            prices=[
+                LabeledPrice(label=product["title"][:32], amount=rub_amount * 100)
+            ],
+        )
+        await callback.answer("Счёт на оплату в рублях отправлен.")
+
+
+@router.pre_checkout_query()
+async def on_pre_checkout(pre_checkout_query: PreCheckoutQuery) -> None:
+    parts = pre_checkout_query.invoice_payload.split(":")
+    if len(parts) < 4 or parts[0] != "order":
+        await pre_checkout_query.answer(ok=False, error_message="Некорректный заказ.")
+        return
+    product = await db.get_product(int(parts[1]))
+    if not product or not product["is_active"]:
+        await pre_checkout_query.answer(
+            ok=False, error_message="Этот товар больше недоступен."
+        )
+        return
+    await pre_checkout_query.answer(ok=True)
+
+
+@router.message(F.successful_payment)
+async def on_successful_payment(message: Message, bot: Bot) -> None:
+    sp = message.successful_payment
+    parts = sp.invoice_payload.split(":")
+    product_id = int(parts[1])
+    product = await db.get_product(product_id)
+
+    currency = sp.currency
+    amount = sp.total_amount if currency == "XTR" else sp.total_amount // 100
+
+    await db.record_order(
+        user_id=message.from_user.id,
+        username=message.from_user.username,
+        product_id=product_id,
+        currency=currency,
+        amount=amount,
+        telegram_charge_id=sp.telegram_payment_charge_id,
+    )
+
+    if not product:
+        await message.answer(
+            "Оплата прошла, но товар не найден в БД. Напиши администратору и укажи ID заказа."
+        )
+        return
+
+    file_path = Path(product["file_path"])
+    if not file_path.exists():
+        await message.answer(
+            f"Оплата за <b>{product['title']}</b> прошла! Файл временно отсутствует на диске — свяжись с автором."
+        )
+    else:
+        doc = FSInputFile(path=file_path, filename=product["original_filename"])
+        await message.answer_document(
+            document=doc,
+            caption=(
+                f"✅ Спасибо за покупку <b>{product['title']}</b>!\n"
+                f"👤 Автор: {product['author']}\n"
+                "Файл проекта прикреплён выше."
+            ),
+        )
+
+    for admin_id in ADMIN_IDS:
+        try:
+            buyer_tag = (
+                f"@{message.from_user.username}"
+                if message.from_user.username
+                else f"ID {message.from_user.id}"
+            )
+            await bot.send_message(
+                admin_id,
+                f"💸 <b>Новая продажа!</b>\n"
+                f"Проект: <b>{product['title']}</b>\n"
+                f"Покупатель: {buyer_tag}\n"
+                f"Сумма: <b>{amount}</b> {currency}",
+            )
+        except Exception:
+            logger.exception("Не удалось уведомить админа %s о продаже", admin_id)
+
+
+# ---------- АДМИН-ПАНЕЛЬ: ДОБАВЛЕНИЕ ТОВАРА ----------
+@router.callback_query(F.data == "admin:add_product")
+async def cb_admin_add_product(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещён.", show_alert=True)
+        return
+    await state.clear()
+    await state.set_state(AddProductFSM.photo)
+    await callback.message.answer(
+        "Шаг 1/7: Отправь <b>скриншот</b> Unity-проекта (фото).",
+        reply_markup=cancel_kb(),
+    )
+    await callback.answer()
+
+
+@router.message(AddProductFSM.photo, F.photo)
+async def fsm_add_photo(message: Message, state: FSMContext) -> None:
+    photo_id = message.photo[-1].file_id
+    await state.update_data(photo_file_id=photo_id)
+    await state.set_state(AddProductFSM.title)
+    await message.answer(
+        "Шаг 2/7: Введи <b>название</b> проекта:", reply_markup=cancel_kb()
+    )
+
+
+@router.message(AddProductFSM.photo)
+async def fsm_add_photo_invalid(message: Message) -> None:
+    await message.answer("Нужно отправить именно картинку (скриншот).")
+
+
+@router.message(AddProductFSM.title, F.text)
+async def fsm_add_title(message: Message, state: FSMContext) -> None:
+    await state.update_data(title=message.text.strip())
+    await state.set_state(AddProductFSM.description)
+    await message.answer(
+        "Шаг 3/7: Введи <b>описание</b> проекта:", reply_markup=cancel_kb()
+    )
+
+
+@router.message(AddProductFSM.description, F.text)
+async def fsm_add_description(message: Message, state: FSMContext) -> None:
+    await state.update_data(description=message.text.strip())
+    await state.set_state(AddProductFSM.author)
+    await message.answer(
+        f"Шаг 4/7: Введи <b>автора</b> (или отправь <code>-</code>, чтобы поставить <b>{DEFAULT_AUTHOR}</b>):",
+        reply_markup=cancel_kb(),
+    )
+
+
+@router.message(AddProductFSM.author, F.text)
+async def fsm_add_author(message: Message, state: FSMContext) -> None:
+    raw = message.text.strip()
+    author = DEFAULT_AUTHOR if raw in ("-", "") else raw
+    await state.update_data(author=author)
+    await state.set_state(AddProductFSM.price_stars)
+    await message.answer(
+        "Шаг 5/7: Введи цену в <b>Telegram Stars</b> (целое число, например <code>250</code>; если только за рубли — введи <code>0</code>):",
+        reply_markup=cancel_kb(),
+    )
+
+
+@router.message(AddProductFSM.price_stars, F.text)
+async def fsm_add_price_stars(message: Message, state: FSMContext) -> None:
+    raw = message.text.strip()
+    if not raw.isdigit():
+        await message.answer("Введи целое неотрицательное число (например, 250 или 0).")
+        return
+    await state.update_data(price_stars=int(raw))
+    await state.set_state(AddProductFSM.price_rub)
+    await message.answer(
+        "Шаг 6/7: Введи цену в <b>рублях</b> (целое число, например <code>500</code>; если только за звёзды — введи <code>0</code>):",
+        reply_markup=cancel_kb(),
+    )
+
+
+@router.message(AddProductFSM.price_rub, F.text)
+async def fsm_add_price_rub(message: Message, state: FSMContext) -> None:
+    raw = message.text.strip()
+    if not raw.isdigit():
+        await message.answer("Введи целое неотрицательное число (например, 500 или 0).")
+        return
+    data = await state.get_data()
+    price_rub = int(raw)
+    if int(data["price_stars"]) <= 0 and price_rub <= 0:
+        await message.answer(
+            "Хотя бы одна цена (в звёздах или в рублях) должна быть больше 0. Введи цену в рублях ещё раз:"
+        )
+        return
+    await state.update_data(price_rub=price_rub)
+    await state.set_state(AddProductFSM.file)
+    await message.answer(
+        "Шаг 7/7: Теперь отправь сам <b>файл проекта</b> (документом — например `.zip`, `.unitypackage`, `.rar`):",
+        reply_markup=cancel_kb(),
+    )
+
+
+@router.message(AddProductFSM.file, F.document)
+async def fsm_add_file(message: Message, state: FSMContext, bot: Bot) -> None:
+    doc = message.document
+    safe_name = Path(doc.file_name or "unity_project.zip").name
+    stored_name = f"{int(datetime.utcnow().timestamp())}_{safe_name}"
+    dest_path = FILES_DIR / stored_name
+
+    await bot.download(doc, destination=dest_path)
+
+    data = await state.get_data()
+    product_id = await db.add_product(
+        title=data["title"],
+        description=data["description"],
+        author=data["author"],
+        photo_file_id=data["photo_file_id"],
+        file_path=str(dest_path),
+        original_filename=safe_name,
+        price_stars=data["price_stars"],
+        price_rub=data["price_rub"],
+    )
+    await state.clear()
+
+    await message.answer(
+        f"✅ Проект <b>#{product_id} — {data['title']}</b> добавлен в витрину и сохранён в автосейв!",
+        reply_markup=main_menu_kb(message.from_user.id),
+    )
+
+
+@router.message(AddProductFSM.file)
+async def fsm_add_file_invalid(message: Message) -> None:
+    await message.answer("Отправь проект именно как файл (документ), а не сжатое фото.")
+
+
+# ---------- АДМИН-ПАНЕЛЬ: УПРАВЛЕНИЕ ТОВАРАМИ, ЦЕНАМИ И СТАТИСТИКОЙ ----------
+async def _render_admin_product(
+    target_message: Message, idx: int, edit_existing: bool = False
+) -> None:
+    products = await db.get_all_products()
+    if not products:
+        text = "Список проектов пуст. Нажми «➕ Добавить проект», чтобы выложить первый."
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="➕ Добавить проект", callback_data="admin:add_product")],
+                [InlineKeyboardButton(text="🏠 В меню", callback_data="menu:main")],
+            ]
+        )
+        if edit_existing and not target_message.photo:
+            await target_message.edit_text(text, reply_markup=kb)
+        else:
+            if edit_existing:
+                await target_message.delete()
+            await target_message.answer(text, reply_markup=kb)
+        return
+
+    safe_idx = idx % len(products)
+    prod = products[safe_idx]
+    status_text = "Активен" if prod["is_active"] else "Скрыт"
+    caption = (
+        f"🛠 <b>Управление #{prod['id']}</b> ({safe_idx + 1}/{len(products)})\n"
+        f"Статус: <b>{status_text}</b>\n"
+        f"Название: <b>{prod['title']}</b>\n"
+        f"Автор: {prod['author']}\n"
+        f"Цена: {format_prices(prod)}\n"
+        f"Файл: <code>{prod['original_filename']}</code>\n\n"
+        f"{prod['description']}"
+    )
+    kb = admin_product_manage_kb(prod, safe_idx, len(products))
+
+    if edit_existing and target_message.photo:
+        from aiogram.types import InputMediaPhoto
+
+        await target_message.edit_media(
+            media=InputMediaPhoto(media=prod["photo_file_id"], caption=caption),
+            reply_markup=kb,
+        )
+    else:
+        if edit_existing:
+            await target_message.delete()
+        await target_message.answer_photo(
+            photo=prod["photo_file_id"], caption=caption, reply_markup=kb
+        )
+
+
+@router.callback_query(F.data.startswith("admin:products:"))
+async def cb_admin_products(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещён.", show_alert=True)
+        return
+    idx = int(callback.data.split(":")[2])
+    await _render_admin_product(callback.message, idx=idx, edit_existing=True)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:toggle:"))
+async def cb_admin_toggle(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещён.", show_alert=True)
+        return
+    _, _, prod_id_str, idx_str = callback.data.split(":")
+    await db.toggle_active(int(prod_id_str))
+    await _render_admin_product(callback.message, idx=int(idx_str), edit_existing=True)
+    await callback.answer("Статус обновлён.")
+
+
+@router.callback_query(F.data.startswith("admin:delete:"))
+async def cb_admin_delete(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещён.", show_alert=True)
+        return
+    _, _, prod_id_str, idx_str = callback.data.split(":")
+    deleted = await db.delete_product(int(prod_id_str))
+    if deleted and deleted.get("file_path"):
+        try:
+            Path(deleted["file_path"]).unlink(missing_ok=True)
+        except OSError:
+            pass
+    await _render_admin_product(callback.message, idx=int(idx_str), edit_existing=True)
+    await callback.answer("Проект удалён.")
+
+
+@router.callback_query(F.data.startswith("admin:edit_price:"))
+async def cb_admin_edit_price(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещён.", show_alert=True)
+        return
+    _, _, prod_id_str, idx_str = callback.data.split(":")
+    await state.clear()
+    await state.set_state(EditPriceFSM.price_stars)
+    await state.update_data(product_id=int(prod_id_str), return_idx=int(idx_str))
+    await callback.message.answer(
+        "Введи новую цену в <b>Telegram Stars</b> (целое число, 0 если отключить):",
+        reply_markup=cancel_kb(),
+    )
+    await callback.answer()
+
+
+@router.message(EditPriceFSM.price_stars, F.text)
+async def fsm_edit_price_stars(message: Message, state: FSMContext) -> None:
+    raw = message.text.strip()
+    if not raw.isdigit():
+        await message.answer("Введи целое неотрицательное число.")
+        return
+    await state.update_data(new_stars=int(raw))
+    await state.set_state(EditPriceFSM.price_rub)
+    await message.answer(
+        "Теперь введи новую цену в <b>рублях</b> (целое число, 0 если отключить):",
+        reply_markup=cancel_kb(),
+    )
+
+
+@router.message(EditPriceFSM.price_rub, F.text)
+async def fsm_edit_price_rub(message: Message, state: FSMContext) -> None:
+    raw = message.text.strip()
+    if not raw.isdigit():
+        await message.answer("Введи целое неотрицательное число.")
+        return
+    data = await state.get_data()
+    new_stars = int(data["new_stars"])
+    new_rub = int(raw)
+    if new_stars <= 0 and new_rub <= 0:
+        await message.answer("Хотя бы одна цена должна быть больше 0. Введи цену в рублях:")
+        return
+
+    await db.update_prices(int(data["product_id"]), new_stars, new_rub)
+    return_idx = int(data.get("return_idx", 0))
+    await state.clear()
+    await message.answer("✅ Цены обновлены и сохранены.")
+    await _render_admin_product(message, idx=return_idx, edit_existing=False)
+
+
+@router.callback_query(F.data == "admin:stats")
+async def cb_admin_stats(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещён.", show_alert=True)
+        return
+    stats = await db.get_stats()
+    text = (
+        "📊 <b>Статистика магазина</b>\n\n"
+        f"📦 Проектов всего: <b>{stats['total_products']}</b> (активных: <b>{stats['active_products']}</b>)\n"
+        f"🧾 Продаж всего: <b>{stats['total_orders']}</b>\n"
+        f"⭐️ Выручка в звёздах: <b>{stats['stars_sum']}</b>\n"
+        f"₽ Выручка в рублях: <b>{stats['rub_sum']}</b>\n"
+        f"💾 Последний автосейв: <code>{stats['last_autosave']}</code>"
+    )
+    if callback.message.photo:
+        await callback.message.delete()
+        await callback.message.answer(text, reply_markup=main_menu_kb(callback.from_user.id))
+    else:
+        await callback.message.edit_text(
+            text, reply_markup=main_menu_kb(callback.from_user.id)
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:force_save")
+async def cb_admin_force_save(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещён.", show_alert=True)
+        return
+    await db.autosave()
+    await callback.answer("Снапшот БД и JSON сохранён!", show_alert=True)
+
+
+# ---------- ФОНОВЫЙ АВТОСЕЙФ КАЖДЫЕ 5 МИНУТ ----------
+async def autosave_loop(interval_seconds: int = 300) -> None:
+    while True:
+        await asyncio.sleep(interval_seconds)
+        try:
+            await db.autosave()
+            logger.info("Периодический автосейв БД выполнен (интервал %sс).", interval_seconds)
+        except Exception:
+            logger.exception("Ошибка при выполнении периодического автосейва")
+
+
+async def main() -> None:
+    if not BOT_TOKEN:
+        raise RuntimeError("Не задана переменная окружения BOT_TOKEN")
+
+    status = db.restore_if_needed()
+    logger.info("Инициализация БД завершена со статусом: %s", status)
+
+    bot = Bot(token=BOT_TOKEN)
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.include_router(router)
+
+    autosave_task = asyncio.create_task(autosave_loop(interval_seconds=300))
+    try:
+        await dp.start_polling(bot)
+    finally:
+        autosave_task.cancel()
+        try:
+            await autosave_task
+        except asyncio.CancelledError:
+            pass
+        await db.autosave()
+        await bot.session.close()
+
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("🛑 Bot stopped")
-    except Exception as e:
-        print(f"❌ Fatal error: {e}")
-        sys.exit(1)
+    asyncio.run(main())
